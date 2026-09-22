@@ -20,3 +20,4 @@ ds-bundle/
 .design-sync/learnings/
 .design-sync/
 __pycache__/
+docs/
