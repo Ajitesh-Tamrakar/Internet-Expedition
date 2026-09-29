@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 from pathlib import Path
 import environ
 import os
+from datetime import timedelta
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -24,13 +25,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 env = environ.Env()
 environ.Env.read_env(os.path.join(BASE_DIR, '.env'), overwrite=False)
 
-SECRET_KEY = env('DJANGO_SECRET_KEY', default=env('SECRET_KEY', default='django-insecure-local-dev-only'))
+SECRET_KEY = env('DJANGO_SECRET_KEY', default=env('SECRET_KEY', default='django-insecure-local-dev-only')) #type: ignore
 DEBUG = env.bool('DJANGO_DEBUG', default=env.bool('DEBUG', default=False))
+SITE_ID = env.int('DJANGO_SITE_ID', default=env.int('SITE_ID', default=1))
 
-
-ALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=['localhost', '127.0.0.1'])
-
-
+ALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=['localhost', '127.0.0.1'])#type: ignore
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:8081",
+    "chrome-extension://neoepajlbbhfoelekkmipdhpaklbbgac",
+]
 # Application definition
 
 INSTALLED_APPS = [
@@ -40,6 +44,18 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django.contrib.sites',
+
+    'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',
+
+    'allauth',
+    'allauth.account',
+    'allauth.socialaccount',
+
+    'dj_rest_auth',
+    'dj_rest_auth.registration',
+
     'core',
     'capture',
     'process',
@@ -55,13 +71,54 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'allauth.account.middleware.AccountMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    'core.middleware.SetupRequiredMiddleware',
+    # 'core.middleware.SetupRequiredMiddleware',
 ]
 
 ROOT_URLCONF = 'bookmark.urls'
 
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES':(
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    )
+}
+
+
+REST_AUTH ={
+        'USE_JWT': True,
+        'TOKEN_MODEL': None,
+        # 'JWT_AUTH_HTTPONLY': False,
+        "SESSION_LOGIN": False,
+}
+
+# ACCOUNT_LOGIN_METHODS = {'email'}
+ACCOUNT_LOGIN_METHODS = {'username', 'email'}
+ACCOUNT_SIGNUP_FIELDS = ['email*','username', 'password1*', 'password2*']
+
+ACCOUNT_EMAIL_VERIFICATION = "mandatory" 
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+
+EMAIL_HOST = env('EMAIL_HOST', default=env('EMAIL_HOST', default='localhost')) #type: ignore
+EMAIL_PORT = env.int('EMAIL_PORT', default=env.int('EMAIL_PORT', default=1025)) #type: ignore
+EMAIL_USE_SSL = env.bool('EMAIL_USE_SSL', default=env.bool('EMAIL_USE_SSL', default=False)) #type: ignore
+EMAIL_USE_TLS = env.bool('EMAIL_USE_TLS', default=env.bool('EMAIL_USE_TLS', default=False)) #type: ignore
+
+EMAIL_HOST_USER = env('EMAIL_HOST_USER', default=env('EMAIL_HOST_USER', default='')) #type: ignore
+EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default=env('EMAIL_HOST_PASSWORD', default='')) #type: ignore
+
+DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default=env('DEFAULT_FROM_EMAIL', default='webmaster@localhost')) #type: ignore
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes = 15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days = 7),
+    "ROTATE_REFRESH_TOKENS": False,
+}
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
@@ -94,12 +151,12 @@ WSGI_APPLICATION = 'bookmark.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': env('DB_NAME', default=env('NAME', default='bookmark')),
-        'USER': env('DB_USER', default='postgres'),
-        'PASSWORD': env('DB_PASSWORD', default=env('PASSWORD', default='postgres')),
-        'HOST': env('DB_HOST', default='localhost'),
-        'PORT': env('DB_PORT', default='5432'),
+        'ENGINE': 'django.db.backends.postgresql', #type: ignore
+        'NAME': env('DB_NAME', default=env('NAME', default='bookmark')), #type: ignore
+        'USER': env('DB_USER', default='postgres'), #type: ignore
+        'PASSWORD': env('DB_PASSWORD', default=env('PASSWORD', default='postgres')),#type: ignore
+        'HOST': env('DB_HOST', default='localhost'),#type: ignore
+        'PORT': env('DB_PORT', default='5432'),#type: ignore
     }
 }
 
@@ -195,3 +252,6 @@ METRICS_DB_PATH = os.environ.get(
 
 # Base64 screenshot payloads (JPEG data URI) can exceed Django's 2.5MB default.
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
+
+MEDIA_ROOT = BASE_DIR / "media"
+MEDIA_URL = "/media/"
