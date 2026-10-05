@@ -227,3 +227,7 @@ async function downloadMedia(url) {
         return null;
     }
 }
+
+
+const SERVER_URL = "http://localhost:5000/upload";
+const MENU_ID = "ie-flask-save";

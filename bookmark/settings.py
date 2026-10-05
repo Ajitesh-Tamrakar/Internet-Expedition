@@ -29,6 +29,8 @@ SECRET_KEY = env('DJANGO_SECRET_KEY', default=env('SECRET_KEY', default='django-
 DEBUG = env.bool('DJANGO_DEBUG', default=env.bool('DEBUG', default=False))
 SITE_ID = env.int('DJANGO_SITE_ID', default=env.int('SITE_ID', default=1))
 
+GEMINI_API_KEY = env.str('GEMINI_API_KEY')
+
 ALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=['localhost', '127.0.0.1'])#type: ignore
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOWED_ORIGINS = [

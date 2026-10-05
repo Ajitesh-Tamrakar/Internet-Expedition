@@ -1,7 +1,8 @@
-from django.db import models
 from pgvector.django import VectorField
-import uuid
 from django.conf import settings
+from django.db import models
+import uuid
+
 
 # Create your models here.
 class Bookmark(models.Model):
@@ -221,5 +222,22 @@ class Capture(models.Model):
     video_sources = models.JSONField(null=True, blank=True, default=list)
     audio_sources = models.JSONField(null=True, blank=True, default=list)
     text_sources = models.JSONField(null=True, blank=True, default=list)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
 
+
+class CaptureContext(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete = models.CASCADE, related_name = 'capture_context', null = True, blank = True)
+    capture_id = models.OneToOneField(Capture, on_delete=models.CASCADE, related_name='capture_context')
+    capture_context_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    text_context = models.TextField()
+    image_context = models.JSONField(null=True, blank=True, default=list)
+    video_context = models.JSONField(null=True, blank=True, default=list)
+    audio_context = models.JSONField(null=True, blank=True, default=list)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "capture_context"
