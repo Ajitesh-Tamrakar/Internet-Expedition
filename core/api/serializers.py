@@ -1,11 +1,14 @@
-from core.models import Capture, CaptureContext
-from django.core.files.base import ContentFile
-from rest_framework import serializers
+import base64
+import re
+import uuid
 from datetime import datetime
 from pathlib import Path
-import base64
-import uuid
-import re
+
+from django.core.files.base import ContentFile
+from rest_framework import serializers
+
+from core.models import Capture, CaptureContext
+
 
 class CaptureSerializer(serializers.ModelSerializer):
     class Meta:
@@ -15,51 +18,58 @@ class CaptureSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         capture_data = self.context["request"].data
-        media = capture_data.get("media")
+        media = capture_data.get("media") or {}
 
         image_sources = []
         for image in media.get("images", []):
             if image.get("url"):
-                id = uuid.uuid4()
+                id = str(uuid.uuid4())
                 image_sources.append({"id": id, "url": image["url"]})
 
         video_sources = []
         for video in media.get("videos", []):
             if video.get("url"):
-                id = uuid.uuid4()
+                id = str(uuid.uuid4())
                 video_sources.append({"id": id, "url": video["url"]})
 
         audio_sources = []
         for audio in media.get("audios", []):
             if audio.get("url"):
-                id = uuid.uuid4()
+                id = str(uuid.uuid4())
                 audio_sources.append({"id": id, "url": audio["url"]})
 
-        image = capture_data.get("image", "")
+        image = capture_data.get("image") or ""
 
-        image_file = None
-
+        screenshot = None
         if image:
             match = re.match(r"^data:image/(png|jpeg);base64,(.+)$", image)
 
             if not match:
                 raise serializers.ValidationError("image: Invalid base64 format")
             ext = "jpg" if match.group(1) == "jpeg" else "png"
-        try:
-            image_bytes = base64.b64decode(match.group(2), validate=True)
-        except Exception as e:
-            raise serializers.ValidationError("image: Invalid base64 format")
+
+            try:
+                image_bytes = base64.b64decode(match.group(2), validate=True)
+            except Exception:
+                raise serializers.ValidationError("image: Invalid base64 format")
+
+            screenshot = ContentFile(
+                image_bytes,
+                name=f"capture_{datetime.now().strftime('%Y%m%d%H%M%S')}.{ext}",
+            )
+
+        # "text" may arrive as a single string or a list; store it as a list.
+        text = capture_data.get("text") or []
+        if isinstance(text, str):
+            text = [text]
 
         return Capture.objects.create(
             user=validated_data["user"],
             image_sources=image_sources,
             video_sources=video_sources,
             audio_sources=audio_sources,
-            screenshot=ContentFile(
-                image_bytes,
-                name=f"capture_{datetime.now().strftime('%Y%m%d%H%M%S')}.{ext}",
-            ),
-            text_sources=capture_data.get("text", []),
+            screenshot=screenshot,
+            text_sources=text,
         )
 
     def to_representation(self, instance):
@@ -76,9 +86,6 @@ class CaptureSerializer(serializers.ModelSerializer):
 
         response["capture"] = "success"
         return response
-
-
-
 
 
 class CaptureContextSerializer(serializers.ModelSerializer):

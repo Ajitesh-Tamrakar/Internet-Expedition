@@ -1,14 +1,15 @@
 import uuid
 
-from core.api.gemini import GeminiProvider
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.viewsets import ModelViewSet
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.viewsets import ModelViewSet
+
+from core.api.gemini import GeminiProvider
 from core.api.serializers import CaptureContextSerializer, CaptureSerializer
 from core.models import Capture, CaptureContext
-from rest_framework.response import Response
 
 
 class CaptureViewSet(ModelViewSet):
@@ -23,15 +24,17 @@ class CaptureViewSet(ModelViewSet):
         serializer.save(user=self.request.user)
 
 
-
-
-
-
 class MultiModelContextExtraction(ModelViewSet):
     serializer_class = CaptureContextSerializer
     permission_classes = [IsAuthenticated]
 
     http_method_names = ["get", "post", "patch", "delete"]
+
+    # Detail routes are keyed by the context's own id:
+    #   GET/PATCH/DELETE /capture-context/<capture_context_id>/
+    # For POST the same URL slot carries the Capture id instead —
+    # create() reads it and interprets it accordingly.
+    lookup_field = "capture_context_id"
 
     def get_queryset(self):
         return CaptureContext.objects.filter(user=self.request.user)
@@ -54,6 +57,15 @@ class MultiModelContextExtraction(ModelViewSet):
 
         # Find using capture_context_id
         if capture_context_id:
+            # A malformed UUID in the URL should 404, not 500.
+            try:
+                uuid.UUID(capture_context_id)
+            except ValueError:
+                return None, Response(
+                    {"detail": ("CaptureContext not found.")},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
             context_from_url = get_object_or_404(
                 CaptureContext,
                 capture_context_id=capture_context_id,
@@ -62,6 +74,15 @@ class MultiModelContextExtraction(ModelViewSet):
 
         # Find using capture_id
         if capture_id:
+            # A malformed UUID should 404, not 500.
+            try:
+                uuid.UUID(capture_id)
+            except ValueError:
+                return None, Response(
+                    {"detail": ("Capture not found.")},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
             capture = get_object_or_404(
                 Capture,
                 capture_id=capture_id,
@@ -96,6 +117,26 @@ class MultiModelContextExtraction(ModelViewSet):
 
         return context, None
 
+    def list(self, request, *args, **kwargs):
+
+        capture_id = request.query_params.get("capture_id")
+
+        # GET /capture-context/?capture_id=<id> resolves to the single
+        # context for that capture.
+        if capture_id is not None:
+            context, error = self.get_context()
+
+            if error:
+                return error
+
+            serializer = self.get_serializer(context)
+
+            return Response(serializer.data)
+
+        # Plain GET /capture-context/ → paginated list of the
+        # user's contexts (standard ModelViewSet behavior).
+        return super().list(request, *args, **kwargs)
+
     def retrieve(self, request, *args, **kwargs):
 
         context, error = self.get_context()
@@ -106,6 +147,97 @@ class MultiModelContextExtraction(ModelViewSet):
         serializer = self.get_serializer(context)
 
         return Response(serializer.data)
+
+    def _extract_contexts(self, capture):
+        """Run the provider over every source of a Capture and return
+        the generated (text, image, video, audio) context values.
+        Shared by create() and partial_update()."""
+
+        provider = GeminiProvider()
+
+        text_context = ""
+        image_context = []
+        video_context = []
+        audio_context = []
+
+        # -------------------------
+        # TEXT
+        # -------------------------
+
+        if capture.text_sources:
+            # Clients may send "text" as a single string or a list;
+            # normalize to a list so we never iterate a string
+            # character-by-character.
+            sources = (
+                [capture.text_sources]
+                if isinstance(capture.text_sources, str)
+                else capture.text_sources
+            )
+            for source in sources:
+                result = provider.summarize_text(source)
+
+                text_context += result
+
+        # -------------------------
+        # IMAGES
+        # -------------------------
+        if capture.image_sources:
+            for source in capture.image_sources:
+                result = provider.describe_image(source)
+
+                image_context.append(
+                    {
+                        "id": source.get("id"),
+                        "context": result,
+                    }
+                )
+
+        # -------------------------
+        # SCREENSHOT
+        # -------------------------
+
+        if capture.screenshot:
+            # Gemini's upload needs a path, not the Django FieldFile object.
+            result = provider.describe_image(capture.screenshot.path)
+
+            image_context.append(
+                {
+                    "id": str(capture.capture_id),
+                    "context": result,
+                }
+            )
+
+        # -------------------------
+        # VIDEOS
+        # -------------------------
+
+        if capture.video_sources:
+            for source in capture.video_sources:
+                result = provider.describe_video(source)
+
+                video_context.append(
+                    {
+                        "id": source.get("id"),
+                        "context": result,
+                    }
+                )
+
+        # -------------------------
+        # AUDIO
+        # -------------------------
+
+        if capture.audio_sources:
+            for source in capture.audio_sources:
+                result = provider.transcribe_audio(source)
+
+                audio_context.append(
+                    {
+                        "id": source.get("id"),
+                        "context": result,
+                    }
+                )
+
+        return text_context, image_context, video_context, audio_context
 
     def create(self, request, *args, **kwargs):
 
@@ -126,9 +258,9 @@ class MultiModelContextExtraction(ModelViewSet):
             )
 
         # The value in the URL slot is the **Capture** id for POST.
-        # (The router currently names this slot "pk"; it will be renamed
-        # to "capture_context_id" when the GET/PATCH/DELETE lookup is fixed.)
-        capture_id = self.kwargs.get("pk")
+        # (The router names this slot "capture_context_id" via
+        # lookup_field; create() reinterprets it as capture_id.)
+        capture_id = self.kwargs.get("capture_context_id")
 
         if not capture_id:
             return Response(
@@ -170,80 +302,12 @@ class MultiModelContextExtraction(ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        provider = GeminiProvider()
-
-        text_context = ""
-        image_context = []
-        video_context = []
-        audio_context = []
-
-        # -------------------------
-        # TEXT
-        # -------------------------
-
-        if capture.text_sources:
-            for source in capture.text_sources:
-                result = provider.summarize_text(source)
-
-                text_context += result
-
-        # -------------------------
-        # IMAGES
-        # -------------------------
-        if capture.image_sources:
-            for source in capture.image_sources:
-                result = provider.describe_image(source)
-
-                image_context.append(
-                    {
-                        "id": source.get("id"),
-                        "context": result,
-                    }
-                )
-
-        # -------------------------
-        # SCREENSHOT
-        # -------------------------
-
-        if capture.screenshot:
-            result = provider.describe_image(capture.screenshot)
-
-            image_context.append(
-                {
-                    "id": str(capture.capture_id),
-                    "context": result,
-                }
-            )
-
-        # -------------------------
-        # VIDEOS
-        # -------------------------
-
-        if capture.video_sources:
-            for source in capture.video_sources:
-                result = provider.describe_video(source)
-
-                video_context.append(
-                    {
-                        "id": source.get("id"),
-                        "context": result,
-                    }
-                )
-
-        # -------------------------
-        # AUDIO
-        # -------------------------
-
-        if capture.audio_sources:
-            for source in capture.audio_sources:
-                result = provider.transcribe_audio(source)
-
-                audio_context.append(
-                    {
-                        "id": source.get("id"),
-                        "context": result,
-                    }
-                )
+        (
+            text_context,
+            image_context,
+            video_context,
+            audio_context,
+        ) = self._extract_contexts(capture)
 
         # -------------------------
         # SAVE
@@ -264,11 +328,7 @@ class MultiModelContextExtraction(ModelViewSet):
                 )
         except IntegrityError:
             return Response(
-                {
-                    "detail": (
-                        "A CaptureContext already exists for this Capture."
-                    )
-                },
+                {"detail": ("A CaptureContext already exists for this Capture.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -286,15 +346,24 @@ class MultiModelContextExtraction(ModelViewSet):
         if error:
             return error
 
-        serializer = self.get_serializer(
-            context,
-            data=request.data,
-            partial=True,
-        )
+        # All context fields are read-only, so the client cannot supply
+        # values — PATCH means "reprocess this Capture and refresh the
+        # stored context".
+        (
+            text_context,
+            image_context,
+            video_context,
+            audio_context,
+        ) = self._extract_contexts(context.capture_id)
 
-        serializer.is_valid(raise_exception=True)
+        context.text_context = text_context
+        context.image_context = image_context
+        context.video_context = video_context
+        context.audio_context = audio_context
 
-        serializer.save()
+        context.save()
+
+        serializer = self.get_serializer(context)
 
         return Response(serializer.data)
 
