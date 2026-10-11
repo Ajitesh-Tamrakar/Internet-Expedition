@@ -7,7 +7,7 @@ from pathlib import Path
 from django.core.files.base import ContentFile
 from rest_framework import serializers
 
-from core.models import Capture, CaptureContext
+from core.models import Capture, CaptureContext, CaptureEmbedding
 
 
 class CaptureSerializer(serializers.ModelSerializer):
@@ -102,6 +102,24 @@ class CaptureContextSerializer(serializers.ModelSerializer):
             "audio_context",
             "created_at",
             "updated_at",
+        ]
+
+        read_only_fields = fields
+
+
+class CaptureEmbeddingSerializer(serializers.ModelSerializer):
+    # Metadata only — the vector (3072 floats ≈ 30KB of JSON) is for
+    # Postgres, never for the client.
+
+    class Meta:
+        model = CaptureEmbedding
+
+        fields = [
+            "id",
+            "source_key",
+            "text",
+            "embedding_model",
+            "created_at",
         ]
 
         read_only_fields = fields

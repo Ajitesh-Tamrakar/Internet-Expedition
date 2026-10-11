@@ -8,6 +8,7 @@ import requests
 from django.conf import settings
 from google import genai
 from google.genai import errors
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ------------------------------------------------------------------
 # Quota guard (temporary, for the free tier)
@@ -25,6 +26,30 @@ _CALL_GAP = 4.5
 _MAX_ATTEMPTS = 3
 _last_call_lock = threading.Lock()
 _last_call_at = 0.0
+
+# ------------------------------------------------------------------
+# Embedding window (gemini-embedding-2)
+#
+# The model accepts at most EMBED_MAX_TOKENS input tokens and outputs
+# a 3072-dim vector. The DB column is unconstrained `vector` (any
+# dimension stores; HNSW indexes cap at 2000 dims, so search stays a
+# sequential scan).
+#
+# The text splitter works in *characters*, so the chunk size below is
+# a character heuristic calibrated to the token window (dense text can
+# run ~3 chars per token). The real guarantee is the count_tokens
+# validation in generate_embeddings: any piece still over
+# EMBED_MAX_TOKENS is re-split until it fits.
+# ------------------------------------------------------------------
+EMBED_MODEL = "gemini-embedding-2"
+EMBED_MAX_TOKENS = 8192
+EMBED_OVERLAP_TOKENS = 800
+EMBED_MAX_CHARS = EMBED_MAX_TOKENS * 3
+EMBED_OVERLAP_CHARS = EMBED_OVERLAP_TOKENS * 2
+# Texts at or under this length cannot exceed EMBED_MAX_TOKENS even at
+# a pathological 1 token per character, so they skip count_tokens and
+# are embedded directly.
+EMBED_FASTPATH_CHARS = EMBED_MAX_TOKENS
 
 
 class GeminiProvider:
@@ -54,7 +79,8 @@ class GeminiProvider:
         return None
 
     def _guarded(self, fn):
-        """Run a generate_content call, paced, with 429 retry."""
+        """Run a Gemini API call (generate_content or embed_content),
+        paced, with 429 retry."""
         for attempt in range(_MAX_ATTEMPTS):
             self._pace()
             try:
@@ -156,12 +182,85 @@ class GeminiProvider:
         return response.text #type: ignore
 
     def generate_embedding(self, text: str) -> list[float]:
-        response = self.client.models.embed_content(
-            model="gemini-embedding-2",
-            contents=text,
+        """Embed a single text that already fits the model window."""
+        response = self._guarded(
+            lambda: self.client.models.embed_content(
+                model=EMBED_MODEL,
+                contents=text,
+            )
         )
 
         return response.embeddings[0].values  #type: ignore
+
+    def count_tokens(self, text: str) -> int:
+        """How many tokens `text` consumes in the embedding model.
+        Paced and retried like every other call."""
+        response = self._guarded(
+            lambda: self.client.models.count_tokens(
+                model=EMBED_MODEL,
+                contents=text,
+            )
+        )
+
+        return response.total_tokens  #type: ignore
+
+    def _ensure_fits(self, chunk: str) -> list[str]:
+        """Return `chunk` as a list of pieces that each fit the model
+        window, splitting on measured tokens (count_tokens), so it is
+        exact regardless of the character-based pre-split. If the
+        splitter cannot shrink a chunk any further (e.g. one unbreakable
+        run of text longer than the window), the chunk is returned as-is
+        and the embed call fails loudly instead of looping forever."""
+        if self.count_tokens(chunk) <= EMBED_MAX_TOKENS:
+            return [chunk]
+
+        pieces = [
+            piece
+            for piece in RecursiveCharacterTextSplitter(
+                chunk_size=max(len(chunk) // 2, 1),
+                chunk_overlap=0,
+            ).split_text(chunk)
+            if piece.strip()
+        ]
+        if len(pieces) <= 1:
+            return [chunk]
+
+        out: list[str] = []
+        for piece in pieces:
+            out.extend(self._ensure_fits(piece))
+        return out
+
+    def generate_embeddings(self, text: str) -> list[tuple[str, list[float]]]:
+        """Embed a possibly long text, returning (chunk_text, vector)
+        pairs in order.
+
+        Short texts (at or under EMBED_FASTPATH_CHARS characters cannot
+        exceed the model window) are embedded directly. Longer texts are
+        pre-split with a character-based splitter (EMBED_MAX_CHARS with
+        EMBED_OVERLAP_CHARS overlap to preserve context across
+        boundaries), each piece is validated with count_tokens and
+        re-split until it fits, then each piece is embedded (paced,
+        429-retried)."""
+        if not text or not text.strip():
+            return []
+
+        if len(text) <= EMBED_FASTPATH_CHARS:
+            return [(text, self.generate_embedding(text))]
+
+        pieces = [
+            piece
+            for piece in RecursiveCharacterTextSplitter(
+                chunk_size=EMBED_MAX_CHARS,
+                chunk_overlap=EMBED_OVERLAP_CHARS,
+            ).split_text(text)
+            if piece.strip()
+        ]
+
+        final: list[str] = []
+        for piece in pieces:
+            final.extend(self._ensure_fits(piece))
+
+        return [(chunk, self.generate_embedding(chunk)) for chunk in final]
 
 
     def transcribe_audio(self, audio_path) -> str:

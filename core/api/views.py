@@ -8,8 +8,13 @@ from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 
 from core.api.gemini import GeminiProvider
-from core.api.serializers import CaptureContextSerializer, CaptureSerializer
-from core.models import Capture, CaptureContext
+from core.api.serializers import (
+    CaptureContextSerializer,
+    CaptureEmbeddingSerializer,
+    CaptureSerializer,
+)
+from core.embedding_builder import build_capture_embeddings
+from core.models import Capture, CaptureContext, CaptureEmbedding
 
 
 class CaptureViewSet(ModelViewSet):
@@ -377,3 +382,142 @@ class MultiModelContextExtraction(ModelViewSet):
         context.delete()
 
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class CaptureEmbeddingViewSet(ModelViewSet):
+    """Builds the embedding rows for a Capture's context.
+
+    Contract (mirrors MultiModelContextExtraction):
+      POST /capture-embedding/<capture_id>/
+          The URL slot carries the **Capture** id, the request body is
+          ignored. (Re)builds that capture's embedding rows from its
+          stored context.
+      GET  /capture-embedding/?capture_id=<id>
+          The capture's embedding rows (metadata only, never vectors).
+
+    The heavy lifting lives in core.embedding_builder.build_capture_
+    embeddings — plain functions, no DRF — so the same code also runs
+    from the `build_capture_embeddings` management command.
+    """
+
+    serializer_class = CaptureEmbeddingSerializer
+    permission_classes = [IsAuthenticated]
+
+    http_method_names = ["get", "post"]
+
+    # Detail routes are keyed by the embedding row's own id (GET). For
+    # POST the same URL slot carries the Capture id instead — create()
+    # reads it and interprets it accordingly.
+    lookup_field = "id"
+
+    def get_queryset(self):
+        return CaptureEmbedding.objects.filter(user=self.request.user)
+
+    def get_capture(self):
+        """Resolve the id (URL slot for POST, ?capture_id= for GET) as
+        the requesting user's Capture. Malformed UUID → 404, not owned
+        → 404 (never leak existence). Returns (capture, error_response).
+        """
+        capture_id = (
+            self.kwargs.get("id")
+            or self.request.query_params.get("capture_id")
+        )
+
+        if not capture_id:
+            return None, Response(
+                {
+                    "detail": (
+                        "Provide a capture_id (in the URL for POST, "
+                        "or as ?capture_id= for GET)."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # A malformed UUID in the URL should 404, not 500.
+        try:
+            capture_id = uuid.UUID(capture_id)
+        except ValueError:
+            return None, Response(
+                {"detail": ("Capture not found.")},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        capture = get_object_or_404(
+            Capture,
+            capture_id=capture_id,
+            user=self.request.user,
+        )
+
+        return capture, None
+
+    def list(self, request, *args, **kwargs):
+        # Plain GET → all the user's embedding rows (standard behavior).
+        if request.query_params.get("capture_id") is None:
+            return super().list(request, *args, **kwargs)
+
+        # GET ?capture_id= → the single capture's rows.
+        capture, error = self.get_capture()
+
+        if error:
+            return error
+
+        rows = (
+            self.get_queryset()
+            .filter(capture_id=capture)
+            .order_by("source_key")
+        )
+
+        return Response(self.get_serializer(rows, many=True).data)
+
+    def create(self, request, *args, **kwargs):
+        # Per the API contract, the capture id goes in the URL — the
+        # ?capture_id= query form is NOT allowed on POST.
+        if request.query_params.get("capture_id") is not None:
+            return Response(
+                {
+                    "detail": (
+                        "POST /capture-embedding/<capture_id>/ takes the "
+                        "capture id in the URL, not as ?capture_id="
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        capture, error = self.get_capture()
+
+        if error:
+            return error
+
+        # Embeddings are derived from the context: it must exist first.
+        context = CaptureContext.objects.filter(
+            capture_id=capture,
+            user=request.user,
+        ).first()
+
+        if context is None:
+            return Response(
+                {
+                    "detail": (
+                        "No CaptureContext for this capture — run "
+                        "POST /capture-context/<capture_id>/ first."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = build_capture_embeddings(context)
+
+        rows = (
+            self.get_queryset()
+            .filter(capture_id=capture)
+            .order_by("source_key")
+        )
+
+        return Response(
+            {
+                **result,
+                "embeddings": self.get_serializer(rows, many=True).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )

@@ -1,5 +1,9 @@
 from rest_framework.routers import DefaultRouter, SimpleRouter
-from core.api.views import CaptureViewSet, MultiModelContextExtraction
+from core.api.views import (
+    CaptureEmbeddingViewSet,
+    CaptureViewSet,
+    MultiModelContextExtraction,
+)
 
 
 class ContextRouter(DefaultRouter):
@@ -46,5 +50,6 @@ router.register('captures', CaptureViewSet, basename='capture')
 
 context_router = ContextRouter()
 context_router.register('capture-context', MultiModelContextExtraction, basename='capture-context')
+context_router.register('capture-embedding', CaptureEmbeddingViewSet, basename='capture-embedding')
 
 urlpatterns = router.urls + context_router.urls

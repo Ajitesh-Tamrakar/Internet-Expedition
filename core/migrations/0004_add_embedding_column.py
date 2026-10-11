@@ -23,6 +23,14 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        # The `vector` type must exist before any vector column can be
+        # added. Docker installs get it from the entrypoint script, but
+        # fresh databases (and the test database) need it here. No-op on
+        # databases where it already exists.
+        migrations.RunSQL(
+            "CREATE EXTENSION IF NOT EXISTS vector;",
+            reverse_sql="DROP EXTENSION IF EXISTS vector;",
+        ),
         migrations.RunPython(
             add_embedding_column,
             reverse_code=remove_embedding_column
