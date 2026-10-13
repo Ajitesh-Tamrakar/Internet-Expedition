@@ -1,14 +1,16 @@
+import logging
 import math
 import uuid
 
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import status
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
-from core.api.gemini import GeminiProvider
+from core import pipeline
 from core.api.serializers import (
     CaptureContextSerializer,
     CaptureEmbeddingSerializer,
@@ -18,6 +20,8 @@ from core.api.serializers import (
 from core.embedding_builder import build_capture_embeddings
 from core.models import Capture, CaptureContext, CaptureEmbedding
 from core.search import search_captures
+
+logger = logging.getLogger(__name__)
 
 
 class CaptureViewSet(ModelViewSet):
@@ -29,7 +33,52 @@ class CaptureViewSet(ModelViewSet):
         return Capture.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        capture = serializer.save(user=self.request.user)
+
+        # The capture is saved; from here the server does the work. The
+        # background pipeline (core.pipeline) takes it from here:
+        # context -> embeddings, with progress visible on `status` (the
+        # client polls GET /captures/<id>/ instead of driving the
+        # per-stage endpoints by hand). If enqueueing fails (broker
+        # hiccup), the capture is still saved and the worker's startup
+        # sweep will pick it up.
+        try:
+            pipeline.enqueue_capture_processing(capture)
+        except Exception:
+            logger.exception(
+                "Failed to enqueue capture %s for background processing; "
+                "it will be picked up by the worker's startup sweep.",
+                capture.capture_id,
+            )
+
+    @action(detail=True, methods=["post"])
+    def retry(self, request, pk=None):
+        """Re-run the full pipeline for a capture, in the background.
+
+        Available for `failed` captures (retry after fixing the cause)
+        and `ready` ones (a full reprocess). Returns 202 with the
+        capture; poll it for the new status.
+        """
+        capture = self.get_object()
+        if capture.status not in (
+            Capture.Status.FAILED,
+            Capture.Status.READY,
+        ):
+            return Response(
+                {
+                    "detail": (
+                        f"This capture is {capture.status.replace('_', ' ')}; "
+                        "retry is available for failed or ready captures."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        pipeline.enqueue_capture_processing(capture)
+        capture.refresh_from_db()
+        return Response(
+            self.get_serializer(capture).data,
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 class MultiModelContextExtraction(ModelViewSet):
@@ -158,94 +207,11 @@ class MultiModelContextExtraction(ModelViewSet):
 
     def _extract_contexts(self, capture):
         """Run the provider over every source of a Capture and return
-        the generated (text, image, video, audio) context values.
-        Shared by create() and partial_update()."""
-
-        provider = GeminiProvider()
-
-        text_context = ""
-        image_context = []
-        video_context = []
-        audio_context = []
-
-        # -------------------------
-        # TEXT
-        # -------------------------
-
-        if capture.text_sources:
-            # Clients may send "text" as a single string or a list;
-            # normalize to a list so we never iterate a string
-            # character-by-character.
-            sources = (
-                [capture.text_sources]
-                if isinstance(capture.text_sources, str)
-                else capture.text_sources
-            )
-            for source in sources:
-                result = provider.summarize_text(source)
-
-                text_context += result
-
-        # -------------------------
-        # IMAGES
-        # -------------------------
-        if capture.image_sources:
-            for source in capture.image_sources:
-                result = provider.describe_image(source)
-
-                image_context.append(
-                    {
-                        "id": source.get("id"),
-                        "context": result,
-                    }
-                )
-
-        # -------------------------
-        # SCREENSHOT
-        # -------------------------
-
-        if capture.screenshot:
-            # Gemini's upload needs a path, not the Django FieldFile object.
-            result = provider.describe_image(capture.screenshot.path)
-
-            image_context.append(
-                {
-                    "id": str(capture.capture_id),
-                    "context": result,
-                }
-            )
-
-        # -------------------------
-        # VIDEOS
-        # -------------------------
-
-        if capture.video_sources:
-            for source in capture.video_sources:
-                result = provider.describe_video(source)
-
-                video_context.append(
-                    {
-                        "id": source.get("id"),
-                        "context": result,
-                    }
-                )
-
-        # -------------------------
-        # AUDIO
-        # -------------------------
-
-        if capture.audio_sources:
-            for source in capture.audio_sources:
-                result = provider.transcribe_audio(source)
-
-                audio_context.append(
-                    {
-                        "id": source.get("id"),
-                        "context": result,
-                    }
-                )
-
-        return text_context, image_context, video_context, audio_context
+        the generated (text, image, video, audio) context values plus
+        the unified summary. The implementation lives in core.pipeline
+        (shared with the background worker); this is a thin delegate so
+        create()/partial_update() keep their shape."""
+        return pipeline.extract_contexts(capture)
 
     def create(self, request, *args, **kwargs):
 
@@ -315,6 +281,7 @@ class MultiModelContextExtraction(ModelViewSet):
             image_context,
             video_context,
             audio_context,
+            summary_text,
         ) = self._extract_contexts(capture)
 
         # -------------------------
@@ -333,6 +300,7 @@ class MultiModelContextExtraction(ModelViewSet):
                     image_context=image_context,
                     video_context=video_context,
                     audio_context=audio_context,
+                    summary_text=summary_text or None,
                 )
         except IntegrityError:
             return Response(
@@ -362,12 +330,17 @@ class MultiModelContextExtraction(ModelViewSet):
             image_context,
             video_context,
             audio_context,
+            summary_text,
         ) = self._extract_contexts(context.capture_id)
 
         context.text_context = text_context
         context.image_context = image_context
         context.video_context = video_context
         context.audio_context = audio_context
+        # Always rewritten from the fresh extraction: on a failed
+        # regeneration this clears the stale summary instead of leaving
+        # a summary of the old content next to the new contexts.
+        context.summary_text = summary_text or None
 
         context.save()
 

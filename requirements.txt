@@ -16,6 +16,8 @@ Django==5.2.14
 django-allauth==65.19.4
 django-cors-headers==4.9.0
 django-environ==0.13.0
+django-picklefield==3.4.0
+django-q2==1.11.1
 django-rest-auth==0.9.5
 djangorestframework==3.18.1
 djangorestframework_simplejwt==5.5.1

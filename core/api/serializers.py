@@ -14,7 +14,10 @@ class CaptureSerializer(serializers.ModelSerializer):
     class Meta:
         model = Capture
         fields = "__all__"
-        read_only_fields = ["user"]
+        # status/error_note are the background pipeline's, not the
+        # client's: the client polls status, it never sets it (retry
+        # goes through POST /captures/<id>/retry/).
+        read_only_fields = ["user", "status", "error_note"]
 
     def create(self, validated_data):
         capture_data = self.context["request"].data
@@ -100,6 +103,7 @@ class CaptureContextSerializer(serializers.ModelSerializer):
             "image_context",
             "video_context",
             "audio_context",
+            "summary_text",
             "created_at",
             "updated_at",
         ]

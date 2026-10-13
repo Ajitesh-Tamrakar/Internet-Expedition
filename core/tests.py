@@ -1,18 +1,28 @@
+import time
+from datetime import timedelta
 import uuid
 from unittest.mock import MagicMock, patch
 
+from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
+from google.genai import errors
 from rest_framework.test import APITestCase
 
-from core.api.gemini import EMBED_DIMENSIONS, GeminiProvider
+from core.api.gemini import EMBED_DIMENSIONS, GeminiProvider, is_window_overflow
 from core.embedding_builder import (
     EXPECTED_DIMENSIONS,
     build_capture_embeddings,
     collect_units,
 )
-from core.models import Capture, CaptureContext, CaptureEmbedding
+from core.models import Capture, CaptureContext, CaptureEmbedding, ProviderRateSlot
+from core.pipeline import (
+    build_unified_text,
+    enqueue_capture_processing,
+    process_capture,
+    sweep_stuck_captures,
+)
 from core.search import PREVIEW_CHARS, search_captures
 
 DIM = EXPECTED_DIMENSIONS  # what the provider is configured to produce (Matryoshka)
@@ -22,19 +32,43 @@ class FakeProvider:
     """In-test stand-in for GeminiProvider: no pacing, no network.
 
     Returns one (text, vector) pair per generate_embeddings call. Set
-    fail_on_text to simulate a failed embed for a specific text.
+    fail_on_text to simulate a failed embed for a specific text; set
+    fail_summary to simulate a failed unified summary; set fail_text
+    to simulate a failed text summarization.
     """
 
-    def __init__(self, dimensions=DIM, fail_on_text=None):
+    def __init__(
+        self,
+        dimensions=DIM,
+        fail_on_text=None,
+        summary="A unified summary.",
+        fail_summary=False,
+        fail_text=False,
+    ):
         self.dimensions = dimensions
         self.fail_on_text = fail_on_text
+        self.summary = summary
+        self.fail_summary = fail_summary
+        self.fail_text = fail_text
         self.embed_calls: list[str] = []
+        self.unified_calls: list[str] = []
 
     def generate_embeddings(self, text):
         self.embed_calls.append(text)
         if self.fail_on_text and text == self.fail_on_text:
             raise RuntimeError("simulated embed failure")
         return [(text, [0.0] * self.dimensions)]
+
+    def summarize_text(self, text):
+        if self.fail_text:
+            raise RuntimeError("simulated text summarization failure")
+        return f"summarized: {text}"
+
+    def unified_context(self, unified_text):
+        self.unified_calls.append(unified_text)
+        if self.fail_summary:
+            raise RuntimeError("simulated summary failure")
+        return self.summary
 
 
 def _make_capture_context(user, text_context="hello world"):
@@ -329,6 +363,510 @@ class CaptureEmbeddingApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["source_key"], "text:context:0")
+
+
+class BuildUnifiedTextTests(TestCase):
+    def test_only_populated_sections_appear(self):
+        unified = build_unified_text(
+            text_context="  some text  ",
+            image_context=[
+                {"id": "i1", "context": "a red truck"},
+                {"id": "i2", "context": "   "},  # whitespace-only → skipped
+            ],
+            video_context=None,  # null → nothing
+            audio_context=[],
+        )
+        self.assertEqual(
+            unified, "[TEXT]\nsome text\n\n[IMAGE i1]\na red truck"
+        )
+
+    def test_all_empty_returns_blank(self):
+        self.assertEqual(build_unified_text("", [], None, []), "")
+
+
+class GeminiUnifiedContextTests(TestCase):
+    def test_single_guarded_call_returns_summary(self):
+        provider = _provider_with_fake_client()
+        provider.client.models.generate_content.return_value = MagicMock(
+            text="  the summary  "
+        )
+        with patch.object(GeminiProvider, "_pace", lambda self: None):
+            out = provider.unified_context("[TEXT]\nhello world")
+        self.assertEqual(out, "the summary")
+        # Paced + guarded: exactly one generate_content call, prompt + doc.
+        provider.client.models.generate_content.assert_called_once()
+        contents = provider.client.models.generate_content.call_args.kwargs[
+            "contents"
+        ]
+        self.assertIn("[TEXT]\nhello world", contents)
+
+    def test_empty_input_makes_no_call(self):
+        provider = _provider_with_fake_client()
+        self.assertEqual(provider.unified_context("   "), "")
+        provider.client.models.generate_content.assert_not_called()
+
+
+class IsWindowOverflowTests(TestCase):
+    def _err(self, code, message):
+        err = errors.ClientError.__new__(errors.ClientError)
+        err.code = code
+        err.message = message
+        return err
+
+    def test_flags_400_window_messages(self):
+        self.assertTrue(is_window_overflow(self._err(400, "Prompt is too long.")))
+        self.assertTrue(
+            is_window_overflow(
+                self._err(400, "Request payload size exceeds limit.")
+            )
+        )
+
+    def test_ignores_other_errors(self):
+        self.assertFalse(
+            is_window_overflow(self._err(429, "Resource has been exhausted"))
+        )
+        self.assertFalse(is_window_overflow(RuntimeError("too long")))
+
+
+class CaptureContextApiTests(APITestCase):
+    def setUp(self):
+        self.user_a = get_user_model().objects.create_user(
+            "a", "a@example.com", "pw"
+        )
+        self.user_b = get_user_model().objects.create_user(
+            "b", "b@example.com", "pw"
+        )
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_post_creates_context_with_summary(self, mock_provider_cls):
+        fake = FakeProvider()
+        mock_provider_cls.return_value = fake
+        capture = Capture.objects.create(
+            user=self.user_a,
+            text_sources=["an article about red trucks"],
+        )
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(f"/capture-context/{capture.capture_id}/")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            response.data["text_context"],
+            "summarized: an article about red trucks",
+        )
+        self.assertEqual(response.data["summary_text"], "A unified summary.")
+        # The summary ran exactly once, over the populated sections only.
+        self.assertEqual(len(fake.unified_calls), 1)
+        self.assertIn("[TEXT]", fake.unified_calls[0])
+        context = CaptureContext.objects.get(capture_id=capture)
+        self.assertEqual(context.summary_text, "A unified summary.")
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_post_summary_failure_still_saves_context(self, mock_provider_cls):
+        # The summary is an optional path: a failed summary must not
+        # prevent the capture from being processed and saved.
+        mock_provider_cls.return_value = FakeProvider(fail_summary=True)
+        capture = Capture.objects.create(
+            user=self.user_a,
+            text_sources=["an article about red trucks"],
+        )
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(f"/capture-context/{capture.capture_id}/")
+        self.assertEqual(response.status_code, 201)
+        context = CaptureContext.objects.get(capture_id=capture)
+        self.assertEqual(
+            context.text_context, "summarized: an article about red trucks"
+        )
+        self.assertIsNone(context.summary_text)
+        self.assertIsNone(response.data["summary_text"])
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_post_all_empty_capture_skips_summary_call(self, mock_provider_cls):
+        fake = FakeProvider()
+        mock_provider_cls.return_value = fake
+        capture = Capture.objects.create(user=self.user_a)  # no sources at all
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(f"/capture-context/{capture.capture_id}/")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(fake.unified_calls, [])  # no paced call burned
+        self.assertIsNone(
+            CaptureContext.objects.get(capture_id=capture).summary_text
+        )
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_post_other_users_capture_is_404(self, mock_provider_cls):
+        mock_provider_cls.return_value = FakeProvider()
+        capture = Capture.objects.create(user=self.user_a)
+        self.client.force_authenticate(self.user_b)
+        response = self.client.post(f"/capture-context/{capture.capture_id}/")
+        self.assertEqual(response.status_code, 404)
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_patch_refreshes_stale_summary(self, mock_provider_cls):
+        mock_provider_cls.return_value = FakeProvider(summary="the new summary")
+        capture = Capture.objects.create(
+            user=self.user_a,
+            text_sources=["an article about red trucks"],
+        )
+        context = CaptureContext.objects.create(
+            user=self.user_a, capture_id=capture, summary_text="stale summary"
+        )
+        self.client.force_authenticate(self.user_a)
+        response = self.client.patch(
+            f"/capture-context/{context.capture_context_id}/"
+        )
+        self.assertEqual(response.status_code, 200)
+        context.refresh_from_db()
+        self.assertEqual(context.summary_text, "the new summary")
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_patch_summary_failure_clears_stale_summary(self, mock_provider_cls):
+        # A failed regeneration must not leave a summary of the OLD
+        # content sitting next to the refreshed contexts.
+        mock_provider_cls.return_value = FakeProvider(fail_summary=True)
+        capture = Capture.objects.create(
+            user=self.user_a,
+            text_sources=["an article about red trucks"],
+        )
+        context = CaptureContext.objects.create(
+            user=self.user_a, capture_id=capture, summary_text="stale summary"
+        )
+        self.client.force_authenticate(self.user_a)
+        response = self.client.patch(
+            f"/capture-context/{context.capture_context_id}/"
+        )
+        self.assertEqual(response.status_code, 200)
+        context.refresh_from_db()
+        self.assertIsNone(context.summary_text)
+
+
+def _stale_delta():
+    """How far back to backdate updated_at to count as 'abandoned'."""
+    minutes = getattr(django_settings, "CAPTURE_STALE_MINUTES", 50)
+    return timedelta(minutes=minutes + 10)
+
+
+class PipelineTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+        self.capture = Capture.objects.create(
+            user=self.user, text_sources=["an article about red trucks"]
+        )
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_process_capture_reaches_ready(self, mock_provider_cls):
+        mock_provider_cls.return_value = FakeProvider()
+
+        process_capture(str(self.capture.capture_id))
+
+        self.capture.refresh_from_db()
+        self.assertEqual(self.capture.status, Capture.Status.READY)
+        self.assertIsNone(self.capture.error_note)
+        context = CaptureContext.objects.get(capture_id=self.capture)
+        self.assertEqual(
+            context.text_context, "summarized: an article about red trucks"
+        )
+        self.assertEqual(context.summary_text, "A unified summary.")
+        # Embeddings: the text unit + the summary unit.
+        self.assertEqual(
+            CaptureEmbedding.objects.filter(capture_id=self.capture).count(), 2
+        )
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_context_phase_failure_lands_failed(self, mock_provider_cls):
+        mock_provider_cls.return_value = FakeProvider(fail_text=True)
+
+        with self.assertRaises(RuntimeError):
+            process_capture(str(self.capture.capture_id))
+
+        self.capture.refresh_from_db()
+        self.assertEqual(self.capture.status, Capture.Status.FAILED)
+        self.assertIn("summarization failure", self.capture.error_note)
+        self.assertFalse(
+            CaptureContext.objects.filter(capture_id=self.capture).exists()
+        )
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_embedding_phase_failure_lands_failed(self, mock_provider_cls):
+        # The context phase succeeds and saves; the embed of the stored
+        # text fails.
+        mock_provider_cls.return_value = FakeProvider(
+            fail_on_text="summarized: an article about red trucks"
+        )
+
+        with self.assertRaises(RuntimeError):
+            process_capture(str(self.capture.capture_id))
+
+        self.capture.refresh_from_db()
+        self.assertEqual(self.capture.status, Capture.Status.FAILED)
+        self.assertIn("simulated embed failure", self.capture.error_note)
+        # The context survived (saved in its own phase); the all-or-
+        # nothing embedding build wrote nothing.
+        self.assertTrue(
+            CaptureContext.objects.filter(capture_id=self.capture).exists()
+        )
+        self.assertEqual(
+            CaptureEmbedding.objects.filter(capture_id=self.capture).count(), 0
+        )
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_rerun_of_ready_capture_is_skipped(self, mock_provider_cls):
+        fake = FakeProvider()
+        mock_provider_cls.return_value = fake
+        process_capture(str(self.capture.capture_id))
+
+        # A duplicate/redelivered task for a finished capture is a
+        # no-op: no API work at all.
+        mock_provider_cls.return_value = FakeProvider()
+        process_capture(str(self.capture.capture_id))
+
+        self.assertEqual(len(fake.unified_calls), 1)
+        self.assertEqual(len(fake.embed_calls), 2)
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_rerun_of_abandoned_capture_is_reclaimed(self, mock_provider_cls):
+        # A worker that died mid-processing: status stuck and
+        # updated_at old. The re-run must claim it and finish it.
+        self.capture.status = Capture.Status.PROCESSING_CONTEXT
+        self.capture.save()
+        Capture.objects.filter(pk=self.capture.pk).update(
+            updated_at=timezone.now() - _stale_delta()
+        )
+
+        mock_provider_cls.return_value = FakeProvider()
+        process_capture(str(self.capture.capture_id))
+
+        self.capture.refresh_from_db()
+        self.assertEqual(self.capture.status, Capture.Status.READY)
+
+    @patch("core.pipeline.GeminiProvider")
+    def test_fresh_inflight_capture_not_stolen(self, mock_provider_cls):
+        # A live worker owns this capture (fresh updated_at): a
+        # duplicate task must not steal it.
+        self.capture.status = Capture.Status.PROCESSING_CONTEXT
+        self.capture.save()
+
+        fake = FakeProvider()
+        mock_provider_cls.return_value = fake
+        process_capture(str(self.capture.capture_id))
+
+        self.assertEqual(fake.unified_calls, [])  # nothing ran
+        self.capture.refresh_from_db()
+        self.assertEqual(self.capture.status, Capture.Status.PROCESSING_CONTEXT)
+
+
+class EnqueueTests(TestCase):
+    def setUp(self):
+        self.user_a = get_user_model().objects.create_user(
+            "a", "a@example.com", "pw"
+        )
+        self.user_b = get_user_model().objects.create_user(
+            "b", "b@example.com", "pw"
+        )
+
+    @patch("core.pipeline.async_task")
+    def test_enqueues_and_sets_pending(self, mock_async):
+        capture = Capture.objects.create(
+            user=self.user_a, text_sources=["x"]
+        )
+
+        self.assertTrue(enqueue_capture_processing(capture))
+
+        capture.refresh_from_db()
+        self.assertEqual(capture.status, Capture.Status.PENDING)
+        mock_async.assert_called_once_with(
+            "core.pipeline.process_capture", str(capture.capture_id)
+        )
+
+    @patch("core.pipeline.async_task")
+    def test_inflight_cap_queues_excess(self, mock_async):
+        for _ in range(2):  # fill the user's slots (default cap: 2)
+            other = Capture.objects.create(user=self.user_a)
+            Capture.objects.filter(pk=other.pk).update(
+                status=Capture.Status.PENDING
+            )
+        capture = Capture.objects.create(user=self.user_a)
+
+        self.assertFalse(enqueue_capture_processing(capture))
+
+        capture.refresh_from_db()
+        self.assertEqual(capture.status, Capture.Status.QUEUED)
+        mock_async.assert_not_called()
+
+    @patch("core.pipeline.async_task")
+    def test_cap_is_per_user(self, mock_async):
+        for _ in range(2):
+            other = Capture.objects.create(user=self.user_b)
+            Capture.objects.filter(pk=other.pk).update(
+                status=Capture.Status.PROCESSING_CONTEXT
+            )
+        capture = Capture.objects.create(user=self.user_a)
+
+        self.assertTrue(enqueue_capture_processing(capture))  # not blocked
+
+
+class SweepTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+
+    @patch("core.pipeline.async_task")
+    def test_requeues_abandoned_and_promotes_queued(self, mock_async):
+        stuck = Capture.objects.create(
+            user=self.user, status=Capture.Status.PROCESSING_CONTEXT
+        )
+        Capture.objects.filter(pk=stuck.pk).update(
+            updated_at=timezone.now() - _stale_delta()
+        )
+        # Another user's fresh in-flight capture: a different user's
+        # budget, so it is neither re-queued nor counted for `self.user`.
+        other_user = get_user_model().objects.create_user(
+            "o", "o@example.com", "pw"
+        )
+        fresh = Capture.objects.create(
+            user=other_user, status=Capture.Status.PROCESSING_EMBEDDINGS
+        )
+        # After the abandoned one is re-queued, the user has 1 of 2
+        # in-flight slots used -> the queued one is promoted.
+        queued = Capture.objects.create(
+            user=self.user, status=Capture.Status.QUEUED
+        )
+
+        requeued = sweep_stuck_captures()
+
+        self.assertEqual(requeued, 2)  # the abandoned one + the promoted one
+        stuck.refresh_from_db()
+        fresh.refresh_from_db()
+        queued.refresh_from_db()
+        self.assertEqual(stuck.status, Capture.Status.PENDING)
+        self.assertEqual(
+            fresh.status, Capture.Status.PROCESSING_EMBEDDINGS
+        )  # untouched
+        self.assertEqual(queued.status, Capture.Status.PENDING)
+        self.assertEqual(mock_async.call_count, 2)
+
+    @patch("core.pipeline.async_task")
+    def test_skips_healthy_backlog(self, mock_async):
+        # A fresh pending capture (its queue row is alive) and a fresh
+        # in-flight one: nothing to do.
+        Capture.objects.create(user=self.user, status=Capture.Status.PENDING)
+        Capture.objects.create(
+            user=self.user, status=Capture.Status.PROCESSING_CONTEXT
+        )
+
+        self.assertEqual(sweep_stuck_captures(), 0)
+        mock_async.assert_not_called()
+
+    @patch("core.pipeline.async_task")
+    def test_no_promotion_when_user_at_cap(self, mock_async):
+        for _ in range(2):
+            c = Capture.objects.create(user=self.user)
+            Capture.objects.filter(pk=c.pk).update(
+                status=Capture.Status.PENDING
+            )
+        queued = Capture.objects.create(
+            user=self.user, status=Capture.Status.QUEUED
+        )
+
+        self.assertEqual(sweep_stuck_captures(), 0)
+
+        queued.refresh_from_db()
+        self.assertEqual(queued.status, Capture.Status.QUEUED)
+
+
+class PaceSlotTests(TestCase):
+    def test_slot_serializes_calls(self):
+        provider = _provider_with_fake_client()
+        provider.client.models.embed_content.return_value = MagicMock(
+            embeddings=[MagicMock(values=[0.0] * DIM)]
+        )
+        with override_settings(GEMINI_CALL_GAP_SECONDS=0.3):
+            start = time.monotonic()
+            provider.generate_embedding("first")
+            provider.generate_embedding("second")
+            elapsed = time.monotonic() - start
+
+        # The second call waited out the gap left by the first.
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertIsNotNone(ProviderRateSlot.objects.get(key="gemini").last_call_at)
+
+    def test_models_come_from_settings(self):
+        provider = _provider_with_fake_client()
+        provider.client.models.generate_content.return_value = MagicMock(text="s")
+        with override_settings(GEMINI_SUMMARY_MODEL="custom-summary-model"):
+            provider.unified_context("hello")
+        kwargs = provider.client.models.generate_content.call_args.kwargs
+        self.assertEqual(kwargs["model"], "custom-summary-model")
+
+
+class CaptureApiAutomationTests(APITestCase):
+    def setUp(self):
+        self.user_a = get_user_model().objects.create_user(
+            "a", "a@example.com", "pw"
+        )
+        self.user_b = get_user_model().objects.create_user(
+            "b", "b@example.com", "pw"
+        )
+
+    @patch("core.pipeline.async_task")
+    def test_post_capture_returns_201_with_pending(self, mock_async):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/", {"text": ["some text"]}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["status"], "pending")
+        self.assertIn("error_note", response.data)
+        self.assertIsNone(response.data["error_note"])
+        self.assertEqual(mock_async.call_count, 1)
+
+    @patch("core.pipeline.async_task")
+    def test_post_capture_over_cap_queues(self, mock_async):
+        self.client.force_authenticate(self.user_a)
+        for _ in range(2):
+            c = Capture.objects.create(user=self.user_a)
+            Capture.objects.filter(pk=c.pk).update(status=Capture.Status.PENDING)
+        response = self.client.post(
+            "/captures/", {"text": ["some text"]}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["status"], "queued")
+        mock_async.assert_not_called()
+
+    @patch("core.pipeline.async_task")
+    def test_retry_failed_capture(self, mock_async):
+        capture = Capture.objects.create(user=self.user_a)
+        Capture.objects.filter(pk=capture.pk).update(
+            status=Capture.Status.FAILED, error_note="ValueError: bad media url"
+        )
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(f"/captures/{capture.capture_id}/retry/")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data["status"], "pending")
+        mock_async.assert_called_once()
+
+    @patch("core.pipeline.async_task")
+    def test_retry_pending_capture_is_409(self, mock_async):
+        capture = Capture.objects.create(user=self.user_a)
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(f"/captures/{capture.capture_id}/retry/")
+        self.assertEqual(response.status_code, 409)
+        mock_async.assert_not_called()
+
+    def test_get_capture_exposes_status(self):
+        capture = Capture.objects.create(user=self.user_a)
+        Capture.objects.filter(pk=capture.pk).update(
+            status=Capture.Status.READY
+        )
+        other = Capture.objects.create(user=self.user_b)
+        self.client.force_authenticate(self.user_a)
+        response = self.client.get(f"/captures/{capture.capture_id}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], "ready")
+        # Isolation: someone else's capture 404s.
+        response = self.client.get(f"/captures/{other.capture_id}/")
+        self.assertEqual(response.status_code, 404)
 
 
 class FakeSearchProvider:

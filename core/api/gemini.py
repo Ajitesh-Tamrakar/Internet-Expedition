@@ -1,31 +1,36 @@
 import os
 import re
 import tempfile
-import threading
 import time
 
 import requests
 from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
 from google import genai
 from google.genai import errors, types
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from core.models import ProviderRateSlot
+
 # ------------------------------------------------------------------
-# Quota guard (temporary, for the free tier)
+# Quota guard
 #
-# The free-tier generate_content quota is 15 requests/minute PER
-# PROJECT. A capture with N sources fires N calls back-to-back and
-# trips it. The guard does two things:
-#   1. Paces calls: a 4.5s gap between calls keeps us at ~13/min.
+# The Gemini quota (15 requests/minute on the free tier; more once the
+# paid tier is approved) is per PROJECT: it covers every user and every
+# process in the deployment. A capture with N sources fires N calls
+# back-to-back and would trip it. The guard does two things:
+#   1. Paces calls: every call must first reserve a slot against a
+#      SHARED database clock (ProviderRateSlot, one row), which
+#      serializes ALL Gemini calls across the whole deployment to one
+#      per GEMINI_CALL_GAP_SECONDS. The clock is in the database rather
+#      than in process memory so any number of web/worker processes
+#      pace together (two in-memory clocks would double the quota).
 #   2. Retries on 429: sleeps for Google's suggested retryDelay,
 #      up to 3 attempts, so bursts finish instead of 500ing.
-# The clock is shared across provider instances (class-level) so
-# concurrent requests in this process pace together.
 # ------------------------------------------------------------------
-_CALL_GAP = 4.5
+_CALL_GAP_DEFAULT = 4.5  # 15 req/min budget -> ~13/min at 4.5s spacing
 _MAX_ATTEMPTS = 3
-_last_call_lock = threading.Lock()
-_last_call_at = 0.0
 
 # ------------------------------------------------------------------
 # Embedding window (gemini-embedding-2)
@@ -47,7 +52,9 @@ _last_call_at = 0.0
 # validation in generate_embeddings: any piece still over
 # EMBED_MAX_TOKENS is re-split until it fits.
 # ------------------------------------------------------------------
-EMBED_MODEL = "gemini-embedding-2"
+# Model names read from settings (with these defaults) so the paid-API
+# swap is a .env change, not a code change.
+EMBED_MODEL = getattr(settings, "GEMINI_EMBED_MODEL", "gemini-embedding-2")
 # Requested output dimension (Matryoshka). Single source of truth —
 # the embedding builder enforces it, search matches against it.
 EMBED_DIMENSIONS = 1536
@@ -60,6 +67,88 @@ EMBED_OVERLAP_CHARS = EMBED_OVERLAP_TOKENS * 2
 # are embedded directly.
 EMBED_FASTPATH_CHARS = EMBED_MAX_TOKENS
 
+# ------------------------------------------------------------------
+# Summary (unified context)
+#
+# One generate_content call over the whole capture: every populated
+# per-source context (text, image descriptions, video descriptions,
+# audio transcripts) joined into one labeled document.
+#
+# We deliberately do NOT pre-truncate: the model window is large and
+# we want to observe real unified-doc sizes before calibrating a cap.
+# If a document ever outgrows the window, the API returns a 400, the
+# caller catches it (the summary is an optional path), and
+# is_window_overflow() flags it in the logs so we learn how big the
+# data actually gets.
+# ------------------------------------------------------------------
+SUMMARY_MODEL = getattr(
+    settings, "GEMINI_SUMMARY_MODEL", "gemini-3.5-flash-lite"
+)
+
+_UNIFIED_SUMMARY_PROMPT = (
+    "The text after this instruction is a saved web capture, organized "
+    "into labeled sections: extracted text, image descriptions, video "
+    "descriptions, and audio transcripts. Some sections may be missing. "
+    "Write a factual summary of the ENTIRE capture, 500-1000 words "
+    "(shorter if the content is thin - never pad to reach the target). "
+    "Cover the main topic, the key facts and claims, notable entities "
+    "(people, organizations, products, places), and concrete details "
+    "such as numbers and dates. Preserve distinctive terms and keywords "
+    "from the content instead of paraphrasing them away, and write in "
+    "the dominant language of the source content. Output only the "
+    "summary itself - no preamble, no title, no 'Here is...' wording."
+)
+
+
+def is_window_overflow(err) -> bool:
+    """Heuristic: does this API error mean the *input* exceeded the
+    model's context window?
+
+    Google answers an oversized generate_content input with a 400 whose
+    message mentions the limit. Used for logging only: we send the full
+    unified document today, and a recognizable log line (with the doc
+    size, added by the caller) is what tells us we need a cap.
+    """
+    if not isinstance(err, errors.ClientError) or getattr(err, "code", None) != 400:
+        return False
+    message = (getattr(err, "message", "") or "").lower()
+    return any(
+        marker in message
+        for marker in ("too long", "exceed", "window", "token", "payload")
+    )
+
+
+def _model(setting_name: str, default: str) -> str:
+    """A model name from settings, falling back to `default`.
+
+    Read per call (not at import) so a settings change is observable
+    without a code change - and testable via override_settings."""
+    return getattr(settings, setting_name, default)
+
+
+def reserve_pace_slot(gap_seconds: float) -> None:
+    """Block until the shared pace slot allows a new API call, then
+    claim it.
+
+    The slot is a single database row, so every process in the
+    deployment (web servers, workers, any number of them) paces
+    together against the project's single API quota. The claim is an
+    atomic read-then-stamp inside a row lock: a process that finds the
+    slot still fresh releases the lock, sleeps the remaining gap, and
+    re-checks - so exactly one process stamps the slot per interval.
+    """
+    while True:
+        with transaction.atomic():
+            slot, _ = ProviderRateSlot.objects.select_for_update().get_or_create(
+                key="gemini"
+            )
+            wait = gap_seconds - (time.time() - slot.last_call_at.timestamp())
+            if wait <= 0:
+                slot.last_call_at = timezone.now()
+                slot.save(update_fields=["last_call_at"])
+                return
+        time.sleep(min(wait, 0.25))
+
 
 class GeminiProvider:
 
@@ -69,12 +158,14 @@ class GeminiProvider:
         )
 
     def _pace(self):
-        global _last_call_at
-        with _last_call_lock:
-            wait = _CALL_GAP - (time.monotonic() - _last_call_at)
-            if wait > 0:
-                time.sleep(wait)
-            _last_call_at = time.monotonic()
+        """Pace this call against the shared database slot.
+
+        The gap comes from GEMINI_CALL_GAP_SECONDS: 4.5s keeps the free
+        tier under its 15 req/min project quota; lower it (one settings
+        change, no code change) when the paid tier lands."""
+        reserve_pace_slot(
+            getattr(settings, "GEMINI_CALL_GAP_SECONDS", _CALL_GAP_DEFAULT)
+        )
 
     @staticmethod
     def _retry_delay(err):
@@ -139,12 +230,38 @@ class GeminiProvider:
     def summarize_text(self, text: str) -> str:
         response = self._guarded(
             lambda: self.client.models.generate_content(
-                model="gemini-3.5-flash-lite",
+                model=_model("GEMINI_FLASH_LITE_MODEL", "gemini-3.5-flash-lite"),
                 contents=text,
             )
         )
 
         return response.text   #type: ignore
+
+    def unified_context(self, unified_text: str) -> str:
+        """Summarize an entire capture in a single call.
+
+        `unified_text` is the joined, source-labeled document produced
+        from the populated per-source contexts (see
+        core.api.views.build_unified_text). Returns the summary, or ""
+        when the input is empty (no API call is made).
+
+        All other errors - including the document outgrowing the model
+        window - propagate to the caller: the summary is an optional
+        path, and the caller degrades to a null summary rather than
+        failing the whole capture.
+        """
+        text = (unified_text or "").strip()
+        if not text:
+            return ""
+
+        response = self._guarded(
+            lambda: self.client.models.generate_content(
+                model=_model("GEMINI_SUMMARY_MODEL", SUMMARY_MODEL),
+                contents=_UNIFIED_SUMMARY_PROMPT + "\n\n" + text,
+            )
+        )
+
+        return (response.text or "").strip()  # type: ignore
 
     def describe_image(self, image_path) -> str:
         local_path = self._resolve_file(image_path)
@@ -156,7 +273,7 @@ class GeminiProvider:
 
             response = self._guarded(
                 lambda: self.client.models.generate_content(
-                    model="gemini-3.5-flash-lite",
+                    model=_model("GEMINI_FLASH_LITE_MODEL", "gemini-3.5-flash-lite"),
                     contents=[
                         "Describe this image in detail.",
                         uploaded_file,
@@ -178,7 +295,7 @@ class GeminiProvider:
 
             response = self._guarded(
                 lambda: self.client.models.generate_content(
-                    model="gemini-3.5-flash-lite",
+                    model=_model("GEMINI_FLASH_LITE_MODEL", "gemini-3.5-flash-lite"),
                     contents=[
                         "Describe this video in detail.",
                         uploaded_file,
@@ -286,7 +403,7 @@ class GeminiProvider:
 
             response = self._guarded(
                 lambda: self.client.models.generate_content(
-                    model="gemini-3.5-flash-lite",
+                    model=_model("GEMINI_FLASH_LITE_MODEL", "gemini-3.5-flash-lite"),
                     contents=[
                         "Transcribe this audio.",
                         uploaded_file,

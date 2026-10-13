@@ -31,6 +31,52 @@ SITE_ID = env.int('DJANGO_SITE_ID', default=env.int('SITE_ID', default=1))
 
 GEMINI_API_KEY = env.str('GEMINI_API_KEY')
 
+# ------------------------------------------------------------------
+# Background capture pipeline (django-q2)
+#
+# The web app enqueues each new capture; a separate long-lived worker
+# process (`python manage.py run_worker`) runs context -> embeddings
+# for each. The queue is Postgres itself (no separate broker service),
+# and every Gemini call paces against a shared database slot, so any
+# number of worker processes share the project's single API quota.
+# ------------------------------------------------------------------
+Q_CLUSTER = {
+    "name": "bookmark",
+    # How many captures one cluster may process at once. The pace slot
+    # (GEMINI_CALL_GAP_SECONDS) is the real quota gate; this trades
+    # per-capture latency for multi-user concurrency.
+    "workers": env.int("Q_WORKERS", default=1),
+    # Kill any single pipeline task that runs longer than this (30 min).
+    "timeout": env.int("Q_TIMEOUT", default=1800),
+    # Re-delivery window for a task whose worker died mid-flight. Must
+    # exceed timeout (django-q2 validates this).
+    "retry": env.int("Q_RETRY", default=2400),
+    # Record a failed task once, don't retry it forever - a broken
+    # capture would otherwise burn API budget on every redelivery.
+    # (Retry manually via POST /captures/<id>/retry/.)
+    "ack_failures": True,
+    "queue_limit": 500,   # max tasks waiting in the database
+    "save_limit": 250,    # completed task rows to keep for inspection
+    "orm": "default",     # the database is the queue
+}
+
+# Per-user fairness: a user's captures process at most this many at a
+# time; the rest wait as `queued` so one user's bulk import cannot
+# starve the shared (project-wide) API quota.
+CAPTURE_INFLIGHT_LIMIT = env.int("CAPTURE_INFLIGHT_LIMIT", default=2)
+
+# A capture stuck in a processing_* state for longer than this is
+# considered abandoned (its worker died) and is re-queued by the
+# worker's startup sweep. Keep it above Q_RETRY/60 (the redelivery
+# window, in minutes) so live work is never mistaken for dead work.
+CAPTURE_STALE_MINUTES = env.int("CAPTURE_STALE_MINUTES", default=50)
+
+# Gemini provider knobs - swap these (in .env) when the paid API lands.
+GEMINI_CALL_GAP_SECONDS = env.float("GEMINI_CALL_GAP_SECONDS", default=4.5)
+GEMINI_FLASH_LITE_MODEL = env.str("GEMINI_FLASH_LITE_MODEL", default="gemini-3.5-flash-lite")
+GEMINI_SUMMARY_MODEL = env.str("GEMINI_SUMMARY_MODEL", default="gemini-3.5-flash-lite")
+GEMINI_EMBED_MODEL = env.str("GEMINI_EMBED_MODEL", default="gemini-embedding-2")
+
 ALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=['localhost', '127.0.0.1'])#type: ignore
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOWED_ORIGINS = [
@@ -59,6 +105,7 @@ INSTALLED_APPS = [
     'dj_rest_auth.registration',
 
     'core',
+    'django_q',
     'corsheaders',
 ]
 
