@@ -79,6 +79,7 @@ GEMINI_EMBED_MODEL = env.str("GEMINI_EMBED_MODEL", default="gemini-embedding-2")
 
 ALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=['localhost', '127.0.0.1'])#type: ignore
 CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_CREDENTIALS = True  # the HttpOnly refresh cookie may cross origins
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:8081",
     "chrome-extension://neoepajlbbhfoelekkmipdhpaklbbgac",
@@ -131,22 +132,58 @@ REST_FRAMEWORK = {
 
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
-    )
+    ),
+
+    # The OTP endpoints are unauthenticated, so they throttle per IP.
+    'DEFAULT_THROTTLE_RATES': {
+        'otp': '5/min',          # registration / login request / resend
+        'otp_confirm': '10/min', # code confirmation
+    },
 }
 
 
-REST_AUTH ={
-        'USE_JWT': True,
-        'TOKEN_MODEL': None,
-        # 'JWT_AUTH_HTTPONLY': False,
-        "SESSION_LOGIN": False,
+REST_AUTH = {
+    'USE_JWT': True,
+    'TOKEN_MODEL': None,
+    "SESSION_LOGIN": False,
+    # Never expose the (unusable) password hash in /user/.
+    'USER_SERIALIZER': 'core.api.auth_serializers.UserSerializer',
+    # ------------------------------------------------------------------
+    # Refresh-token cookie (dj-rest-auth's JWT cookie support, see
+    # dj_rest_auth.jwt_auth). The refresh token is delivered as an HttpOnly
+    # cookie and stripped from JSON bodies, so it is invisible to
+    # JavaScript (an XSS payload cannot read it); the access token stays in
+    # the body for the client to keep in localStorage.
+    # 'JWT_AUTH_HTTPONLY' stays at its default (True) on purpose.
+    # ------------------------------------------------------------------
+    'JWT_AUTH_REFRESH_COOKIE': env.str("JWT_AUTH_REFRESH_COOKIE", default="refresh_token"),
+    # Only the auth endpoints ever see the cookie.
+    'JWT_AUTH_REFRESH_COOKIE_PATH': '/api/auth/',
+    # Plain-HTTP dev stays testable; production (DEBUG off) sends Secure.
+    'JWT_AUTH_SECURE': not DEBUG,
+    # Set JWT_AUTH_SAMESITE=None in .env only if the frontend calls the API
+    # cross-origin (same-origin/vite-proxy works fine with Lax).
+    'JWT_AUTH_SAMESITE': env.str("JWT_AUTH_SAMESITE", default="Lax"),
 }
 
-# ACCOUNT_LOGIN_METHODS = {'email'}
-ACCOUNT_LOGIN_METHODS = {'username', 'email'}
-ACCOUNT_SIGNUP_FIELDS = ['email*','username', 'password1*', 'password2*']
+# ------------------------------------------------------------------
+# Passwordless, email-OTP authentication (replaces username/password)
+#
+# Login is a one-time 6-digit code delivered by email; accounts have an
+# unusable password. Code generation/delivery reuse django-allauth
+# (adapter.generate_login_code + send_mail); the code state itself is a
+# stateless OneTimeToken row - see core.otp / core.api.auth_views.
+# ------------------------------------------------------------------
+ACCOUNT_LOGIN_METHODS = {'email'}
+ACCOUNT_SIGNUP_FIELDS = ['email*']
+ACCOUNT_EMAIL_VERIFICATION = "none"   # verified via the OTP code instead
 
-ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+# 6-digit numeric login code (see allauth generate_user_code)
+ACCOUNT_LOGIN_BY_CODE_FORMAT = {"numeric": True, "length": 6, "dashed": False}
+
+OTP_CODE_TTL_SECONDS = env.int("OTP_CODE_TTL_SECONDS", default=300)  # 5 min
+OTP_MAX_ATTEMPTS = env.int("OTP_MAX_ATTEMPTS", default=5)
+OTP_MAX_RESENDS = env.int("OTP_MAX_RESENDS", default=3)
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 
 EMAIL_HOST = env('EMAIL_HOST', default=env('EMAIL_HOST', default='localhost')) #type: ignore
@@ -160,9 +197,14 @@ EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default=env('EMAIL_HOST_PASSWOR
 DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default=env('DEFAULT_FROM_EMAIL', default='webmaster@localhost')) #type: ignore
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes = 15),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days = 7),
-    "ROTATE_REFRESH_TOKENS": False,
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    # Every refresh issues a new token and blacklists the old one, so a
+    # stolen refresh token is usable at most once. Requires
+    # rest_framework_simplejwt.token_blacklist (installed above); the
+    # rotated token travels in the HttpOnly refresh cookie, not the body.
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 TEMPLATES = [
     {

@@ -1,22 +1,33 @@
+import re
 import time
 from datetime import timedelta
 import uuid
 from unittest.mock import MagicMock, patch
 
+from allauth.account.models import EmailAddress
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
+from django.core import mail
 from django.test import TestCase, override_settings
 from django.utils import timezone
 from google.genai import errors
 from rest_framework.test import APITestCase
 
+from core import otp
+from core.api import auth_views
 from core.api.gemini import EMBED_DIMENSIONS, GeminiProvider, is_window_overflow
 from core.embedding_builder import (
     EXPECTED_DIMENSIONS,
     build_capture_embeddings,
     collect_units,
 )
-from core.models import Capture, CaptureContext, CaptureEmbedding, ProviderRateSlot
+from core.models import (
+    Capture,
+    CaptureContext,
+    CaptureEmbedding,
+    OneTimeToken,
+    ProviderRateSlot,
+)
 from core.pipeline import (
     build_unified_text,
     enqueue_capture_processing,
@@ -867,6 +878,329 @@ class CaptureApiAutomationTests(APITestCase):
         # Isolation: someone else's capture 404s.
         response = self.client.get(f"/captures/{other.capture_id}/")
         self.assertEqual(response.status_code, 404)
+
+
+# ---------------------------------------------------------------------------
+# Passwordless email-OTP authentication
+# ---------------------------------------------------------------------------
+
+
+def _wrong_code(code: str) -> str:
+    return "9" * 6 if code != "9" * 6 else "8" * 6
+
+
+class OneTimeTokenServiceTests(TestCase):
+    """core.otp service: hashing, single-use, expiry, attempts, resends."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+        EmailAddress.objects.create(
+            user=self.user, email="u@example.com", primary=True, verified=False
+        )
+
+    def _issue_capturing_code(self):
+        sent = {}
+
+        def fake_send(user, code):
+            sent["code"] = code
+
+        with patch.object(otp, "_send_code_email", side_effect=fake_send):
+            token = otp.issue_code(user=self.user)
+        return token, sent["code"]
+
+    def test_code_stored_only_as_salted_hash(self):
+        token, code = self._issue_capturing_code()
+        self.assertEqual(len(token.code_hash), 64)  # sha256 hex digest
+        self.assertEqual(len(token.salt), 32)
+        self.assertNotEqual(token.code_hash, code)
+
+    def test_issue_retires_previous_live_tokens(self):
+        self._issue_capturing_code()
+        self._issue_capturing_code()
+        self.assertEqual(
+            OneTimeToken.objects.filter(user=self.user).count(), 2
+        )
+        self.assertEqual(
+            OneTimeToken.objects.filter(
+                user=self.user, consumed_at__isnull=True
+            ).count(),
+            1,
+        )
+
+    def test_verify_is_single_use(self):
+        _, code = self._issue_capturing_code()
+        self.assertTrue(otp.verify_code(user=self.user, code=code))
+        self.assertFalse(otp.verify_code(user=self.user, code=code))  # consumed
+
+    def test_wrong_codes_exhaust_attempts_and_lock_out(self):
+        _, code = self._issue_capturing_code()
+        for _ in range(otp.MAX_ATTEMPTS):
+            self.assertFalse(
+                otp.verify_code(user=self.user, code=_wrong_code(code))
+            )
+        # The live token is now invalidated: even the right code fails.
+        self.assertFalse(otp.verify_code(user=self.user, code=code))
+        # A fresh code works again.
+        _, new_code = self._issue_capturing_code()
+        self.assertTrue(otp.verify_code(user=self.user, code=new_code))
+
+    def test_expired_code_is_rejected_and_invalidated(self):
+        token, code = self._issue_capturing_code()
+        OneTimeToken.objects.filter(pk=token.pk).update(
+            expires_at=timezone.now() - timedelta(minutes=1)
+        )
+        self.assertFalse(otp.verify_code(user=self.user, code=code))
+        token.refresh_from_db()
+        self.assertIsNotNone(token.consumed_at)
+
+    def test_resend_quota(self):
+        for _ in range(otp.MAX_RESENDS):
+            self._issue_capturing_code()
+        self.assertFalse(otp.can_resend(user=self.user))
+
+
+class OtpApiTests(APITestCase):
+    REG = "/api/auth/registration/"
+    REQ = "/api/auth/login/request/"
+    CONFIRM = "/api/auth/login/confirm/"
+
+    def setUp(self):
+        # DRF freezes SimpleRateThrottle.THROTTLE_RATES at import time, so
+        # override_settings cannot raise the limits; bypass the throttle
+        # outright (the quota logic under test lives in core.otp, not in
+        # the throttle).
+        self._throttle_patches = [
+            patch.object(auth_views._OtpThrottle, "allow_request", return_value=True),
+            patch.object(
+                auth_views._OtpConfirmThrottle, "allow_request", return_value=True
+            ),
+        ]
+        for p in self._throttle_patches:
+            p.start()
+        self.addCleanup(self._stop_throttle_patches)
+
+    def _stop_throttle_patches(self):
+        for p in reversed(self._throttle_patches):
+            p.stop()
+
+    def _code_from_outbox(self) -> str:
+        self.assertEqual(len(mail.outbox), 1)
+        match = re.search(r"\b(\d{6})\b", mail.outbox[0].body)
+        self.assertIsNotNone(match, f"no 6-digit code in: {mail.outbox[0].body!r}")
+        return match.group(1)
+
+    def _make_user(self, email="u@example.com"):
+        user = get_user_model().objects.create_user("u", email, "pw")
+        EmailAddress.objects.create(
+            user=user, email=email, primary=True, verified=True
+        )
+        return user
+
+    def test_register_confirm_full_flow_issues_working_jwt(self):
+        response = self.client.post(
+            self.REG, {"email": "new@example.com"}, format="json"
+        )
+        self.assertEqual(response.status_code, 202)
+        code = self._code_from_outbox()
+        self.assertIn("new@example.com", mail.outbox[0].to[0])
+
+        response = self.client.post(
+            self.CONFIRM,
+            {"email": "new@example.com", "code": code},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+        # The refresh token is delivered as an HttpOnly cookie, not in the body.
+        self.assertNotIn("refresh", response.data)
+        self.assertIn("refresh_token", response.cookies)
+        self.assertEqual(response.data["user"]["email"], "new@example.com")
+        self.assertNotIn("password", response.data["user"])
+
+        user = get_user_model().objects.get(email="new@example.com")
+        self.assertFalse(user.has_usable_password())
+        self.assertTrue(user.is_active)
+        self.assertTrue(EmailAddress.objects.get(user=user).verified)
+
+        # The minted JWT works on a protected endpoint.
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {response.data['access']}"
+        )
+        self.assertEqual(self.client.get("/captures/").status_code, 200)
+
+    def test_register_duplicate_is_409_and_sends_no_mail(self):
+        self._make_user("dup@example.com")
+        response = self.client.post(
+            self.REG, {"email": "dup@example.com"}, format="json"
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_request_unknown_email_is_200_but_sends_nothing(self):
+        response = self.client.post(
+            self.REQ, {"email": "ghost@example.com"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_login_request_then_confirm(self):
+        self._make_user()
+        response = self.client.post(
+            self.REQ, {"email": "u@example.com"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        code = self._code_from_outbox()
+
+        response = self.client.post(
+            self.CONFIRM, {"email": "u@example.com", "code": code}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+
+        # The code is single-use: replaying it fails.
+        response = self.client.post(
+            self.CONFIRM, {"email": "u@example.com", "code": code}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_confirm_rejects_wrong_and_unknown_codes_genericly(self):
+        self._make_user()
+        self.client.post(self.REQ, {"email": "u@example.com"}, format="json")
+        code = self._code_from_outbox()
+
+        wrong = self.client.post(
+            self.CONFIRM,
+            {"email": "u@example.com", "code": _wrong_code(code)},
+            format="json",
+        )
+        self.assertEqual(wrong.status_code, 400)
+        ghost = self.client.post(
+            self.CONFIRM, {"email": "ghost@example.com", "code": code},
+            format="json",
+        )
+        self.assertEqual(ghost.status_code, 400)
+        self.assertEqual(wrong.data["detail"], ghost.data["detail"])  # same message
+
+    def test_resend_respects_quota(self):
+        self._make_user()
+        for _ in range(otp.MAX_RESENDS):
+            response = self.client.post(
+                self.REQ, {"email": "u@example.com"}, format="json"
+            )
+            self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), otp.MAX_RESENDS)
+
+        # Quota exhausted: still 200, but no additional mail.
+        response = self.client.post(
+            self.REQ, {"email": "u@example.com"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), otp.MAX_RESENDS)
+
+    def test_user_endpoint_never_exposes_password(self):
+        self._make_user()
+        self.client.post(self.REQ, {"email": "u@example.com"}, format="json")
+        code = self._code_from_outbox()
+        response = self.client.post(
+            self.CONFIRM, {"email": "u@example.com", "code": code}, format="json"
+        )
+        access = response.data["access"]
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        response = self.client.get("/api/auth/user/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("password", response.data)
+
+
+class TokenRotationTests(APITestCase):
+    """Refresh-token lifecycle: cookie delivery, rotation, one-time use,
+    blacklist, logout. The refresh token lives in the HttpOnly cookie named
+    by REST_AUTH['JWT_AUTH_REFRESH_COOKIE']; the Django test client persists
+    it in its cookie jar across requests."""
+
+    CONFIRM = "/api/auth/login/confirm/"
+    REFRESH = "/api/auth/token/refresh/"
+    LOGOUT = "/api/auth/logout/"
+    REFRESH_COOKIE = "refresh_token"
+
+    def setUp(self):
+        self._throttle_patches = [
+            patch.object(auth_views._OtpThrottle, "allow_request", return_value=True),
+            patch.object(
+                auth_views._OtpConfirmThrottle, "allow_request", return_value=True
+            ),
+        ]
+        for p in self._throttle_patches:
+            p.start()
+        self.addCleanup(self._stop_throttle_patches)
+
+    def _stop_throttle_patches(self):
+        for p in reversed(self._throttle_patches):
+            p.stop()
+
+    def _log_in(self, email="u@example.com"):
+        """Create a user, issue a code in-process, confirm it via the API."""
+        user = get_user_model().objects.create_user("u", email, "pw")
+        EmailAddress.objects.create(
+            user=user, email=email, primary=True, verified=True
+        )
+        sent = {}
+        with patch.object(
+            otp, "_send_code_email", side_effect=lambda u, c: sent.update(code=c)
+        ):
+            otp.issue_code(user=user)
+        response = self.client.post(
+            self.CONFIRM, {"email": email, "code": sent["code"]}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        return response
+
+    def test_confirm_sets_refresh_cookie_and_strips_it_from_body(self):
+        response = self._log_in()
+        self.assertNotIn("refresh", response.data)
+        self.assertIn(self.REFRESH_COOKIE, response.cookies)
+        self.assertTrue(response.cookies[self.REFRESH_COOKIE].value)
+
+    def test_refresh_rotates_and_old_token_is_blacklisted(self):
+        response = self._log_in()
+        old = response.cookies[self.REFRESH_COOKIE].value
+
+        # The cookie jar holds the refresh token; refresh works and rotates.
+        r = self.client.post(self.REFRESH)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("access", r.data)
+        self.assertNotIn("refresh", r.data)
+        rotated = r.cookies[self.REFRESH_COOKIE].value
+        self.assertNotEqual(rotated, old)
+
+        # The rotated (new) token works ...
+        self.client.cookies[self.REFRESH_COOKIE] = rotated
+        self.assertEqual(self.client.post(self.REFRESH).status_code, 200)
+
+        # ... but the original is blacklisted: each token is single-use.
+        self.client.cookies[self.REFRESH_COOKIE] = old
+        self.assertEqual(self.client.post(self.REFRESH).status_code, 401)
+
+    def test_refresh_without_any_token_is_401(self):
+        self._log_in()
+        del self.client.cookies[self.REFRESH_COOKIE]
+        self.assertEqual(self.client.post(self.REFRESH).status_code, 401)
+
+    def test_logout_blacklists_refresh_and_clears_cookie(self):
+        response = self._log_in()
+        original = response.cookies[self.REFRESH_COOKIE].value
+
+        r = self.client.post(self.LOGOUT)
+        self.assertEqual(r.status_code, 200)
+        # The Set-Cookie expiry emptied it (the test client keeps the key
+        # with an empty value, mirroring a browser dropping the cookie).
+        self.assertEqual(self.client.cookies[self.REFRESH_COOKIE].value, "")
+
+        # And the token itself no longer refreshes.
+        self.client.cookies[self.REFRESH_COOKIE] = original
+        self.assertEqual(self.client.post(self.REFRESH).status_code, 401)
 
 
 class FakeSearchProvider:

@@ -110,3 +110,54 @@ class ProviderRateSlot(models.Model):
     """
     key = models.CharField(max_length=50, primary_key=True)
     last_call_at = models.DateTimeField(default=_epoch, editable=False)
+
+
+class OneTimeToken(models.Model):
+    """A single-use, expiring code for passwordless login/signup.
+
+    The code itself is never stored - only a salted SHA-256 hash
+    (see core.otp), so a database leak does not expose live codes.
+    """
+
+    class Channel(models.TextChoices):
+        EMAIL = "email", "Email"
+        # SMS = "sms", "SMS"   # Phase 2: add a provider + channel.
+
+    class Purpose(models.TextChoices):
+        LOGIN = "login", "Login"
+        SIGNUP = "signup", "Signup / email verification"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="one_time_tokens",
+    )
+    channel = models.CharField(
+        max_length=20, choices=Channel.choices, default=Channel.EMAIL
+    )
+    purpose = models.CharField(
+        max_length=20, choices=Purpose.choices, default=Purpose.LOGIN
+    )
+    salt = models.CharField(max_length=64)
+    code_hash = models.CharField(max_length=128)
+    expires_at = models.DateTimeField()
+    attempts = models.PositiveSmallIntegerField(default=0)
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "one_time_tokens"
+        indexes = [
+            models.Index(
+                fields=["user", "channel", "consumed_at", "-created_at"]
+            )
+        ]
+
+    @property
+    def is_valid(self) -> bool:
+        return self.consumed_at is None and self.expires_at > timezone.now()
+
+    def invalidate(self) -> None:
+        self.consumed_at = timezone.now()
+        self.save(update_fields=["consumed_at"])
