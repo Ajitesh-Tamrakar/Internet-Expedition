@@ -14,9 +14,6 @@ dump/
 
 # Runtime
 media/
-temp/
-tmp/*
-!tmp/.gitkeep
 
 # design-sync
 .ds-sync/
