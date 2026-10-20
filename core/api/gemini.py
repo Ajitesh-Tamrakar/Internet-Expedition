@@ -7,7 +7,7 @@ import time
 import requests
 from django.conf import settings
 from google import genai
-from google.genai import errors
+from google.genai import errors, types
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ------------------------------------------------------------------
@@ -30,10 +30,16 @@ _last_call_at = 0.0
 # ------------------------------------------------------------------
 # Embedding window (gemini-embedding-2)
 #
-# The model accepts at most EMBED_MAX_TOKENS input tokens and outputs
-# a 3072-dim vector. The DB column is unconstrained `vector` (any
-# dimension stores; HNSW indexes cap at 2000 dims, so search stays a
-# sequential scan).
+# The model accepts at most EMBED_MAX_TOKENS input tokens and is
+# Matryoshka: it can be asked for any of 768 / 1536 / 3072 output
+# dimensions. We request EMBED_DIMENSIONS — 1536: half the storage of
+# 3072, and under pgvector's 2000-dim HNSW cap, so an index becomes
+# possible (the current no-LIMIT search query still seq-scans — HNSW
+# index scans require ORDER BY ... LIMIT).
+#
+# The DB column stays unconstrained `vector`: rows written before the
+# 1536 switch are 3072-dim and must still store; search skips any row
+# whose dimension doesn't match the query vector.
 #
 # The text splitter works in *characters*, so the chunk size below is
 # a character heuristic calibrated to the token window (dense text can
@@ -42,6 +48,9 @@ _last_call_at = 0.0
 # EMBED_MAX_TOKENS is re-split until it fits.
 # ------------------------------------------------------------------
 EMBED_MODEL = "gemini-embedding-2"
+# Requested output dimension (Matryoshka). Single source of truth —
+# the embedding builder enforces it, search matches against it.
+EMBED_DIMENSIONS = 1536
 EMBED_MAX_TOKENS = 8192
 EMBED_OVERLAP_TOKENS = 800
 EMBED_MAX_CHARS = EMBED_MAX_TOKENS * 3
@@ -182,11 +191,15 @@ class GeminiProvider:
         return response.text #type: ignore
 
     def generate_embedding(self, text: str) -> list[float]:
-        """Embed a single text that already fits the model window."""
+        """Embed a single text that already fits the model window,
+        compressed to EMBED_DIMENSIONS dimensions."""
         response = self._guarded(
             lambda: self.client.models.embed_content(
                 model=EMBED_MODEL,
                 contents=text,
+                config=types.EmbedContentConfig(
+                    output_dimensionality=EMBED_DIMENSIONS
+                ),
             )
         )
 

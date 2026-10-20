@@ -1,3 +1,4 @@
+import math
 import uuid
 
 from django.db import IntegrityError, transaction
@@ -5,16 +6,18 @@ from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.viewsets import ModelViewSet
+from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
 from core.api.gemini import GeminiProvider
 from core.api.serializers import (
     CaptureContextSerializer,
     CaptureEmbeddingSerializer,
     CaptureSerializer,
+    SearchResultSerializer,
 )
 from core.embedding_builder import build_capture_embeddings
 from core.models import Capture, CaptureContext, CaptureEmbedding
+from core.search import search_captures
 
 
 class CaptureViewSet(ModelViewSet):
@@ -521,3 +524,75 @@ class CaptureEmbeddingViewSet(ModelViewSet):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+class SearchViewSet(GenericViewSet):
+    """Semantic search over the authenticated user's captures.
+
+    Contract:
+      GET /search/?q=<text>[&k=<n>][&min_score=<f>]
+
+    `q` (the text to search for) is required; missing/blank → 400.
+    `k` caps the number of captures and `min_score` is a floor on the
+    capture's best-chunk score; both optional, and both off by default
+    — every capture is returned so the caller can see the full score
+    distribution before choosing a threshold.
+
+    One paced Gemini embedding call per request embeds the query; the
+    viewset doesn't care which model produces it — the provider is the
+    source of truth. Results: unique captures ranked best-first, each
+    carrying all of its chunks (best-first) with per-chunk scores.
+    Read-only: no DB rows are written.
+    """
+
+    serializer_class = SearchResultSerializer
+    permission_classes = [IsAuthenticated]
+
+    http_method_names = ["get"]
+
+    @staticmethod
+    def _bad(message):
+        return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+
+    @classmethod
+    def _parse_limits(cls, query_params):
+        """Return (k, min_score, error_response) from the query params.
+        Absent params stay None (= off)."""
+
+        k = None
+        min_score = None
+
+        if query_params.get("k") is not None:
+            try:
+                k = int(query_params["k"])
+            except ValueError:
+                return None, None, cls._bad("k must be a positive integer.")
+            if k < 1:
+                return None, None, cls._bad("k must be a positive integer.")
+
+        if query_params.get("min_score") is not None:
+            try:
+                min_score = float(query_params["min_score"])
+            except ValueError:
+                return None, None, cls._bad("min_score must be a number.")
+            if not math.isfinite(min_score):
+                return None, None, cls._bad("min_score must be a finite number.")
+
+        return k, min_score, None
+
+    def list(self, request, *args, **kwargs):
+        query = (request.query_params.get("q") or "").strip()
+
+        if not query:
+            return self._bad("q is required (the text to search for).")
+
+        k, min_score, error = self._parse_limits(request.query_params)
+
+        if error:
+            return error
+
+        results = search_captures(
+            request.user, query, k=k, min_score=min_score
+        )
+
+        return Response(self.get_serializer(results, many=True).data)

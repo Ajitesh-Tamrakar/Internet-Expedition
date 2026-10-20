@@ -3,6 +3,7 @@ from core.api.views import (
     CaptureEmbeddingViewSet,
     CaptureViewSet,
     MultiModelContextExtraction,
+    SearchViewSet,
 )
 
 
@@ -47,6 +48,7 @@ class ContextRouter(DefaultRouter):
 
 router = DefaultRouter()
 router.register('captures', CaptureViewSet, basename='capture')
+router.register('search', SearchViewSet, basename='search')
 
 context_router = ContextRouter()
 context_router.register('capture-context', MultiModelContextExtraction, basename='capture-context')

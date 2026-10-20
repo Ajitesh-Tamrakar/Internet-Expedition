@@ -107,8 +107,33 @@ class CaptureContextSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class ChunkSerializer(serializers.Serializer):
+    """One embedding row of a search result: what matched, and how well.
+
+    `text` is a preview (truncated by the search helper); the full
+    chunk text is retrievable from GET /capture-embedding/.
+    """
+
+    source_key = serializers.CharField()
+    score = serializers.FloatField()
+    text = serializers.CharField()
+
+
+class SearchResultSerializer(serializers.Serializer):
+    """A search hit: one capture, ranked, carrying all of its chunks
+    (best-first). `score` is the capture's best-chunk cosine similarity
+    (higher = more relevant; not a percentage)."""
+
+    capture_id = serializers.UUIDField()
+    rank = serializers.IntegerField()
+    score = serializers.FloatField()
+    summary_text = serializers.CharField(allow_null=True)
+    created_at = serializers.DateTimeField(allow_null=True)
+    chunks = ChunkSerializer(many=True)
+
+
 class CaptureEmbeddingSerializer(serializers.ModelSerializer):
-    # Metadata only — the vector (3072 floats ≈ 30KB of JSON) is for
+    # Metadata only — the vector (1536 floats ≈ 12KB of JSON) is for
     # Postgres, never for the client.
 
     class Meta:

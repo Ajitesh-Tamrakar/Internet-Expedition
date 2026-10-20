@@ -1,14 +1,21 @@
+import uuid
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from core.api.gemini import GeminiProvider
-from core.embedding_builder import build_capture_embeddings, collect_units
+from core.api.gemini import EMBED_DIMENSIONS, GeminiProvider
+from core.embedding_builder import (
+    EXPECTED_DIMENSIONS,
+    build_capture_embeddings,
+    collect_units,
+)
 from core.models import Capture, CaptureContext, CaptureEmbedding
+from core.search import PREVIEW_CHARS, search_captures
 
-DIM = 3072  # gemini-embedding-2 default output dimension
+DIM = EXPECTED_DIMENSIONS  # what the provider is configured to produce (Matryoshka)
 
 
 class FakeProvider:
@@ -197,6 +204,9 @@ class GeminiEmbeddingWindowTests(TestCase):
         self.assertEqual(len(pairs[0][1]), DIM)
         provider.client.models.count_tokens.assert_not_called()
         provider.client.models.embed_content.assert_called_once()
+        # The Matryoshka compression is requested on the API call itself.
+        embed_kwargs = provider.client.models.embed_content.call_args.kwargs
+        self.assertEqual(embed_kwargs["config"].output_dimensionality, EMBED_DIMENSIONS)
 
     def test_long_text_is_split_validated_and_embedded(self):
         provider = _provider_with_fake_client()
@@ -224,6 +234,11 @@ class GeminiEmbeddingWindowTests(TestCase):
         )
         for chunk_text, vector in pairs:
             self.assertEqual(len(vector), DIM)
+        # Every embed call requested the configured output dimension.
+        for call in provider.client.models.embed_content.call_args_list:
+            self.assertEqual(
+                call.kwargs["config"].output_dimensionality, EMBED_DIMENSIONS
+            )
 
     def test_empty_text_yields_nothing(self):
         provider = _provider_with_fake_client()
@@ -314,3 +329,278 @@ class CaptureEmbeddingApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["source_key"], "text:context:0")
+
+
+class FakeSearchProvider:
+    """In-test stand-in for the provider's generate_embedding: no
+    pacing, no network. Returns one fixed vector per query and records
+    the query texts it was asked to embed."""
+
+    def __init__(self, vector):
+        self.vector = vector
+        self.query_calls: list[str] = []
+
+    def generate_embedding(self, text):
+        self.query_calls.append(text)
+        return self.vector
+
+
+def _vec(*values, dim=4):
+    return list(values) + [0.0] * (dim - len(values))
+
+
+LONG_TEXT = "word " * 100  # well past PREVIEW_CHARS
+
+
+class SearchHelperTests(TestCase):
+    """search_captures against real Postgres vectors (pgvector does the
+    cosine math), with a fake provider for the query embedding."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+        self.other = get_user_model().objects.create_user(
+            "o", "o@example.com", "pw"
+        )
+
+        # Query vector is +x. Similarities are by construction:
+        #   [1,0,0,0]   → 1.0
+        #   [0.5,0.5,0,0] → 1/√2 ≈ 0.7071
+        #   [0.3,0.4,0,0] → 0.6
+        #   [0,1,0,0]   → 0.0
+
+        self.capture_a = Capture.objects.create(user=self.user)
+        CaptureContext.objects.create(
+            user=self.user,
+            capture_id=self.capture_a,
+            text_context="truck page",
+            summary_text="A page about red trucks",
+        )
+        for key, vector, text in (
+            ("text:context:0", _vec(1.0), LONG_TEXT),
+            ("text:context:1", _vec(0.5, 0.5), "a corner of the page"),
+        ):
+            CaptureEmbedding.objects.create(
+                user=self.user,
+                capture_id=self.capture_a,
+                source_key=key,
+                text=text,
+                embedding=vector,
+                embedding_model="gemini-embedding-2",
+            )
+        # A row without a vector never participates in scoring.
+        CaptureEmbedding.objects.create(
+            user=self.user,
+            capture_id=self.capture_a,
+            source_key="image:img-1:0",
+            text="unembedded image",
+            embedding=None,
+            embedding_model=None,
+        )
+
+        self.capture_b = Capture.objects.create(user=self.user)
+        CaptureContext.objects.create(
+            user=self.user,
+            capture_id=self.capture_b,
+            text_context="engine page",
+            summary_text=None,  # not generated yet
+        )
+        for key, vector, text in (
+            ("text:context:0", _vec(0.3, 0.4), "engine details"),
+            ("summary:global:0", _vec(0.0, 1.0), "engine summary"),
+        ):
+            CaptureEmbedding.objects.create(
+                user=self.user,
+                capture_id=self.capture_b,
+                source_key=key,
+                text=text,
+                embedding=vector,
+                embedding_model="gemini-embedding-2",
+            )
+
+        # Another user's capture, identical best vector: must never leak.
+        other_capture = Capture.objects.create(user=self.other)
+        CaptureEmbedding.objects.create(
+            user=self.other,
+            capture_id=other_capture,
+            source_key="text:context:0",
+            text="their page",
+            embedding=_vec(1.0),
+            embedding_model="gemini-embedding-2",
+        )
+
+    def _search(self, **kwargs):
+        provider = FakeSearchProvider(_vec(1.0))
+        return search_captures(
+            self.user, "a red truck", provider=provider, **kwargs
+        ), provider
+
+    def test_ranks_captures_by_best_chunk(self):
+        results, _ = self._search()
+        self.assertEqual(
+            [r["capture_id"] for r in results],
+            [self.capture_a.capture_id, self.capture_b.capture_id],
+        )
+        self.assertEqual([r["rank"] for r in results], [1, 2])
+        self.assertAlmostEqual(results[0]["score"], 1.0, places=6)
+        self.assertAlmostEqual(results[1]["score"], 0.6, places=6)
+
+    def test_each_capture_appears_once_with_all_chunks_best_first(self):
+        results, _ = self._search()
+        a, b = results
+        self.assertEqual(
+            [c["source_key"] for c in a["chunks"]],
+            ["text:context:0", "text:context:1"],
+        )
+        self.assertAlmostEqual(a["chunks"][0]["score"], 1.0, places=6)
+        self.assertAlmostEqual(a["chunks"][1]["score"], 0.707107, places=6)
+        # The null-vector row never appears.
+        self.assertNotIn("image:img-1:0", [c["source_key"] for c in a["chunks"]])
+        self.assertEqual(
+            [c["source_key"] for c in b["chunks"]],
+            ["text:context:0", "summary:global:0"],
+        )
+
+    def test_returns_metadata(self):
+        results, _ = self._search()
+        a, b = results
+        self.assertEqual(a["summary_text"], "A page about red trucks")
+        self.assertIsNotNone(a["created_at"])
+        self.assertIsNone(b["summary_text"])  # context without a summary
+
+    def test_chunk_text_is_a_preview(self):
+        results, _ = self._search()
+        self.assertEqual(len(results[0]["chunks"][0]["text"]), PREVIEW_CHARS)
+
+    def test_other_users_captures_are_excluded(self):
+        results, _ = self._search()
+        self.assertEqual(len(results), 2)
+        self.assertTrue(
+            all(r["capture_id"] in (self.capture_a.capture_id, self.capture_b.capture_id)
+                for r in results)
+        )
+
+    def test_k_limits_captures(self):
+        results, _ = self._search(k=1)
+        self.assertEqual([r["capture_id"] for r in results], [self.capture_a.capture_id])
+
+    def test_min_score_filters_on_best_chunk(self):
+        # A's best is 1.0, B's best is 0.6 → only A survives a 0.8 floor.
+        results, _ = self._search(min_score=0.8)
+        self.assertEqual([r["capture_id"] for r in results], [self.capture_a.capture_id])
+        # Both survive a 0.5 floor.
+        results, _ = self._search(min_score=0.5)
+        self.assertEqual(len(results), 2)
+
+    def test_legacy_dimension_rows_are_skipped(self):
+        # A 3072-dim row from before the 1536 switch: it must be skipped
+        # (pgvector would error on a mixed-dimension distance op), not
+        # crash the search.
+        CaptureEmbedding.objects.create(
+            user=self.user,
+            capture_id=self.capture_b,
+            source_key="text:context:legacy",
+            text="legacy chunk",
+            embedding=[0.5] * 3072,
+            embedding_model="gemini-embedding-2",
+        )
+        results, _ = self._search()
+        self.assertEqual(len(results), 2)
+        self.assertNotIn(
+            "text:context:legacy",
+            [c["source_key"] for c in results[1]["chunks"]],
+        )
+
+    def test_query_is_embedded_once(self):
+        _, provider = self._search()
+        self.assertEqual(provider.query_calls, ["a red truck"])
+
+
+class SearchApiTests(APITestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "a", "a@example.com", "pw"
+        )
+
+    def test_requires_auth(self):
+        response = self.client.get("/search/", {"q": "x"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_missing_q_is_400(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/search/")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("q", str(response.data["detail"]))
+
+    def test_blank_q_is_400(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/search/", {"q": "   "})
+        self.assertEqual(response.status_code, 400)
+
+    @patch("core.api.views.search_captures")
+    def test_invalid_k_is_400(self, mock_search):
+        self.client.force_authenticate(self.user)
+        for bad_k in ("abc", "0", "-2"):
+            response = self.client.get("/search/", {"q": "x", "k": bad_k})
+            self.assertEqual(response.status_code, 400, bad_k)
+        mock_search.assert_not_called()
+
+    @patch("core.api.views.search_captures")
+    def test_invalid_min_score_is_400(self, mock_search):
+        self.client.force_authenticate(self.user)
+        for bad in ("abc", "nan", "inf"):
+            response = self.client.get("/search/", {"q": "x", "min_score": bad})
+            self.assertEqual(response.status_code, 400, bad)
+        mock_search.assert_not_called()
+
+    @patch("core.api.views.search_captures")
+    def test_success_shape(self, mock_search):
+        capture_id = uuid.uuid4()
+        mock_search.return_value = [
+            {
+                "capture_id": capture_id,
+                "rank": 1,
+                "score": 0.87,
+                "summary_text": "a page about red trucks",
+                "created_at": timezone.now(),
+                "chunks": [
+                    {
+                        "source_key": "summary:global:0",
+                        "score": 0.87,
+                        "text": "This page describes a red truck…",
+                    },
+                    {
+                        "source_key": "text:context:1",
+                        "score": 0.4,
+                        "text": "a corner of the page",
+                    },
+                ],
+            }
+        ]
+        self.client.force_authenticate(self.user)
+        response = self.client.get(
+            "/search/", {"q": "red truck", "k": "3", "min_score": "0.5"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        hit = response.data[0]
+        self.assertEqual(hit["capture_id"], str(capture_id))
+        self.assertEqual(hit["rank"], 1)
+        self.assertAlmostEqual(hit["score"], 0.87)
+        self.assertEqual(hit["summary_text"], "a page about red trucks")
+        self.assertEqual(hit["chunks"][0]["source_key"], "summary:global:0")
+        # The vector never leaves the DB — not in the response either.
+        self.assertNotIn("embedding", hit)
+        mock_search.assert_called_once_with(
+            self.user, "red truck", k=3, min_score=0.5
+        )
+
+    @patch("core.api.views.search_captures")
+    def test_no_filters_by_default(self, mock_search):
+        mock_search.return_value = []
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/search/", {"q": "anything"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+        mock_search.assert_called_once_with(self.user, "anything", k=None, min_score=None)

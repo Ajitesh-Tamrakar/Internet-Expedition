@@ -21,12 +21,13 @@ failed build is safe to simply re-run.
 
 from django.db import transaction
 
-from core.api.gemini import EMBED_MODEL, GeminiProvider
+from core.api.gemini import EMBED_DIMENSIONS, EMBED_MODEL, GeminiProvider
 from core.models import CaptureEmbedding, CaptureContext
 
-# gemini-embedding-2's default output dimension. The DB column is
-# unconstrained `vector`, so this is enforced here at write time.
-EXPECTED_DIMENSIONS = 3072
+# The dimension the provider is configured to request (Matryoshka).
+# The DB column is unconstrained `vector`, so this is enforced here
+# at write time.
+EXPECTED_DIMENSIONS = EMBED_DIMENSIONS
 
 
 def collect_units(context: CaptureContext) -> list[tuple[str, str, str]]:
