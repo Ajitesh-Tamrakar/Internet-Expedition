@@ -7,7 +7,7 @@ import uuid
 # Create your models here.
 
 class Capture(models.Model):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete = models.CASCADE, related_name = 'captures', null = True, blank = True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete = models.CASCADE, related_name = 'captures')
     capture_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     screenshot = models.ImageField(upload_to='media/', null=True, blank=True)
     image_sources = models.JSONField(null=True, blank=True, default=list)
@@ -20,7 +20,7 @@ class Capture(models.Model):
 
 
 class CaptureContext(models.Model):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete = models.CASCADE, related_name = 'capture_context', null = True, blank = True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete = models.CASCADE, related_name = 'capture_context')
     capture_id = models.OneToOneField(Capture, on_delete=models.CASCADE, related_name='capture_context')
     capture_context_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     text_context = models.TextField()
@@ -45,7 +45,7 @@ class CaptureEmbedding(models.Model):
         SUMMARY = "summary", "Summary"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='capture_embeddings', null=True, blank=True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='capture_embeddings')
     capture_id = models.ForeignKey(Capture, on_delete=models.CASCADE, related_name='embeddings')
     # "source_type:source_id:chunk_index", e.g. "image:abc123:0", "text:context:1", "summary:global:0"
     source_key = models.CharField(max_length=255)
