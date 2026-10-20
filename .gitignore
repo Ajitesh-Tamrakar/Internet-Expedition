@@ -17,12 +17,6 @@ media/
 temp/
 tmp/*
 !tmp/.gitkeep
-logs/*
-!logs/.gitkeep
-metrics/
-
-# Frontend
-frontend/README.md
 
 # design-sync
 .ds-sync/
