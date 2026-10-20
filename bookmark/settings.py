@@ -99,7 +99,7 @@ REST_AUTH ={
 ACCOUNT_LOGIN_METHODS = {'username', 'email'}
 ACCOUNT_SIGNUP_FIELDS = ['email*','username', 'password1*', 'password2*']
 
-ACCOUNT_EMAIL_VERIFICATION = "mandatory" 
+ACCOUNT_EMAIL_VERIFICATION = "mandatory"
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 
 EMAIL_HOST = env('EMAIL_HOST', default=env('EMAIL_HOST', default='localhost')) #type: ignore
@@ -140,7 +140,7 @@ WSGI_APPLICATION = 'bookmark.wsgi.application'
 
 #sqlite db connection
 
-# DATABASES = {  
+# DATABASES = {
 #     'default': {
 #         'ENGINE': 'django.db.backends.sqlite3',
 #         'NAME': BASE_DIR / 'db.sqlite3',
