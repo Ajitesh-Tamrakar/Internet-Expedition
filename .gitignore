@@ -1,23 +1,30 @@
-Reason 2: Roku Gains Content Strength__pycache__
+# Python
+__pycache__/
+*.log
+venv/
+dump/
+
+# Environment
 .env
-venv
+
+# Editor / OS
 .vscode/
 .idea/
 .DS_Store
-*.log
+
+# Runtime
+media/
 temp/
-frontend/README.md
 tmp/*
 !tmp/.gitkeep
 logs/*
 !logs/.gitkeep
 metrics/
 
+# Frontend
+frontend/README.md
+
 # design-sync
 .ds-sync/
 ds-bundle/
-.design-sync/.cache/
-.design-sync/learnings/
 .design-sync/
-__pycache__/
-docs/

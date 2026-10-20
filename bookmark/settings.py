@@ -59,10 +59,6 @@ INSTALLED_APPS = [
     'dj_rest_auth.registration',
 
     'core',
-    'capture',
-    'process',
-    'retrieve',
-    'evaluate',
     'corsheaders',
 ]
 
@@ -202,19 +198,7 @@ LOGGING = {
             'propagate': False,
         },
 
-        'core': {  
-            'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False,
-        },
-
-        'capture': {   
-            'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False,
-        },
-
-        'process': {   
+        'core': {
             'handlers': ['console'],
             'level': 'INFO',
             'propagate': False,
