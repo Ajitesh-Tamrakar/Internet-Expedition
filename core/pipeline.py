@@ -21,14 +21,21 @@ Safety across processes and restarts:
 
 The capture's `status` field is the client-facing state machine:
 
-    queued? -> pending -> processing_context -> processing_embeddings
-        -> ready
+    queued? -> pending -> processing_media -> processing_context
+        -> processing_embeddings -> ready
                (any step fails -> failed + error_note; retry via
                 POST /captures/<id>/retry/)
 
 `queued` sits before `pending` for captures whose user is over the
 per-user in-flight cap (CAPTURE_INFLIGHT_LIMIT); the worker's startup
 sweep promotes them as slots free up.
+
+`processing_media` is the storage step
+(core.storage.ingest_capture_media): it pulls still-external
+images/videos/audio into the storage backend (Supabase bucket, or local
+disk in fallback) so the context phase reads from media the app owns.
+It is a fast no-op for captures whose media is already stored (the
+client sent files, or a previous run stored them).
 """
 
 import logging
@@ -42,6 +49,12 @@ from django_q.tasks import async_task
 from core.api.gemini import GeminiProvider, is_window_overflow
 from core.embedding_builder import build_capture_embeddings
 from core.models import Capture, CaptureContext
+from core.storage import (
+    fetchable_reference,
+    ingest_capture_media,
+    media_exists,
+    resolve_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +68,12 @@ def _inflight_statuses() -> list[str]:
     `queued` deliberately does NOT count: it is waiting, not running.
     """
     s = Capture.Status
-    return [s.PENDING, s.PROCESSING_CONTEXT, s.PROCESSING_EMBEDDINGS]
+    return [
+        s.PENDING,
+        s.PROCESSING_MEDIA,
+        s.PROCESSING_CONTEXT,
+        s.PROCESSING_EMBEDDINGS,
+    ]
 
 
 def _stale_cutoff():
@@ -111,6 +129,15 @@ def extract_contexts(capture, provider=None) -> tuple:
     """
     provider = provider or GeminiProvider()
 
+    # Store any still-external media in the storage backend before the
+    # provider calls below resolve their sources. A fast no-op when the
+    # worker already ran the media phase (or nothing is external): an
+    # entry is only processed while it has an external URL and no
+    # original_url. Raises MediaIngestError when a download fails —
+    # the worker maps that to `failed`, exactly like any provider
+    # failure.
+    capture = ingest_capture_media(capture)
+
     text_context = ""
     image_context = []
     video_context = []
@@ -139,7 +166,10 @@ def extract_contexts(capture, provider=None) -> tuple:
     # -------------------------
     if capture.image_sources:
         for source in capture.image_sources:
-            result = provider.describe_image(source)
+            # resolve_source turns a storage-bucket path into something
+            # the provider can fetch (a URL, or a local path in
+            # fallback mode); external URLs pass through untouched.
+            result = provider.describe_image(resolve_source(source))
 
             image_context.append(
                 {
@@ -153,15 +183,34 @@ def extract_contexts(capture, provider=None) -> tuple:
     # -------------------------
 
     if capture.screenshot:
-        # Gemini's upload needs a path, not the Django FieldFile object.
-        result = provider.describe_image(capture.screenshot.path)
+        # Resolve the stored screenshot (a URL in Supabase mode, a
+        # local path in fallback mode) — Gemini's upload needs a
+        # fetchable reference, not the Django FieldFile object.
+        #
+        # A screenshot that no longer exists anywhere (a capture made
+        # before storage existed, whose local file died with a deploy)
+        # is SKIPPED, not a failure: a source that never survived
+        # degrades the capture, while a declared media item whose link
+        # died still fails it (that surfaces in the ingest/provider
+        # step, as before).
+        if media_exists(capture.screenshot.name):
+            result = provider.describe_image(
+                fetchable_reference(capture.screenshot.name)
+            )
 
-        image_context.append(
-            {
-                "id": str(capture.capture_id),
-                "context": result,
-            }
-        )
+            image_context.append(
+                {
+                    "id": str(capture.capture_id),
+                    "context": result,
+                }
+            )
+        else:
+            logger.warning(
+                "screenshot for capture %s is missing from storage (%s); "
+                "skipping it",
+                capture.capture_id,
+                capture.screenshot.name,
+            )
 
     # -------------------------
     # VIDEOS
@@ -169,7 +218,7 @@ def extract_contexts(capture, provider=None) -> tuple:
 
     if capture.video_sources:
         for source in capture.video_sources:
-            result = provider.describe_video(source)
+            result = provider.describe_video(resolve_source(source))
 
             video_context.append(
                 {
@@ -184,7 +233,7 @@ def extract_contexts(capture, provider=None) -> tuple:
 
     if capture.audio_sources:
         for source in capture.audio_sources:
-            result = provider.transcribe_audio(source)
+            result = provider.transcribe_audio(resolve_source(source))
 
             audio_context.append(
                 {
@@ -281,8 +330,9 @@ def _set_status(capture, status_value, error_note=None) -> None:
 
 
 def process_capture(capture_id) -> None:
-    """Run the whole pipeline for one capture: context phase, then
-    embedding phase. This is the function the worker executes.
+    """Run the whole pipeline for one capture: media ingest, then
+    context phase, then embedding phase. This is the function the
+    worker executes.
 
     The status transitions are the source of truth the client polls and
     the recovery sweep trusts. On failure the capture is marked `failed`
@@ -303,19 +353,32 @@ def process_capture(capture_id) -> None:
     # no-ops. In-flight states are only claimed when the capture looks
     # ABANDONED (updated_at old): a fresh in-flight capture belongs to a
     # live worker and must not be stolen, and a `ready`/`failed`
-    # capture is done until explicitly retried.
+    # capture is done until explicitly retried. The claim always lands
+    # on the phase the run must (re)start at: fresh work starts at
+    # media ingest; a capture abandoned AFTER the media phase resumes
+    # at context (its media is already stored — ingest is idempotent,
+    # so starting earlier would only cost time, not correctness).
     if capture.status in (s.PENDING, s.QUEUED):
         claimed = Capture.objects.filter(
             pk=capture.pk, status__in=[s.PENDING, s.QUEUED]
         ).update(
-            status=s.PROCESSING_CONTEXT, error_note=None, updated_at=timezone.now()
+            status=s.PROCESSING_MEDIA, error_note=None, updated_at=timezone.now()
         )
+        start_phase = s.PROCESSING_MEDIA
+    elif capture.status == s.PROCESSING_MEDIA:
+        claimed = Capture.objects.filter(
+            pk=capture.pk, status=s.PROCESSING_MEDIA, updated_at__lt=_stale_cutoff()
+        ).update(
+            status=s.PROCESSING_MEDIA, error_note=None, updated_at=timezone.now()
+        )
+        start_phase = s.PROCESSING_MEDIA
     elif capture.status in (s.PROCESSING_CONTEXT, s.PROCESSING_EMBEDDINGS):
         claimed = Capture.objects.filter(
             pk=capture.pk, status=capture.status, updated_at__lt=_stale_cutoff()
         ).update(
             status=s.PROCESSING_CONTEXT, error_note=None, updated_at=timezone.now()
         )
+        start_phase = s.PROCESSING_CONTEXT
     else:
         logger.info(
             "pipeline: capture %s is %s; already complete, skipping",
@@ -328,12 +391,20 @@ def process_capture(capture_id) -> None:
         logger.info("pipeline: capture %s claimed by another run; skipping", capture_id)
         return
 
-    capture.status = s.PROCESSING_CONTEXT
+    capture.status = start_phase
     capture.error_note = None
     # One paced provider for the whole run (pacing is per-call anyway).
     provider = GeminiProvider()
 
     try:
+        if start_phase == s.PROCESSING_MEDIA:
+            # Storage step: pull still-external media into the storage
+            # backend. Idempotent (never re-downloads stored media); a
+            # failed download raises MediaIngestError listing every
+            # cause -> `failed` below, same as any provider failure.
+            capture = ingest_capture_media(capture)
+            _set_status(capture, s.PROCESSING_CONTEXT)
+
         build_capture_context(capture, provider)
         _set_status(capture, s.PROCESSING_EMBEDDINGS)
         context = CaptureContext.objects.get(capture_id=capture)
@@ -413,6 +484,7 @@ def sweep_stuck_captures() -> int:
     #    finishes or fails its capture long before `stale`).
     for capture in Capture.objects.filter(
         status__in=[
+            Capture.Status.PROCESSING_MEDIA,
             Capture.Status.PROCESSING_CONTEXT,
             Capture.Status.PROCESSING_EMBEDDINGS,
         ],

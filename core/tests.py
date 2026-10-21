@@ -1,8 +1,21 @@
+import base64
+import contextlib
+import io
+import json
+import os
 import re
+import shutil
+import tempfile
 import time
 from datetime import timedelta
 import uuid
 from unittest.mock import MagicMock, patch
+
+from django.core.exceptions import ImproperlyConfigured
+from django.core.files import File
+from django.core.files.base import ContentFile
+from django.core.files.storage import FileSystemStorage
+from django.core.files.uploadedfile import SimpleUploadedFile
 
 from allauth.account.models import EmailAddress
 from django.conf import settings as django_settings
@@ -13,7 +26,7 @@ from django.utils import timezone
 from google.genai import errors
 from rest_framework.test import APITestCase
 
-from core import otp
+from core import otp, storage as media_storage
 from core.api import auth_views
 from core.api.gemini import EMBED_DIMENSIONS, GeminiProvider, is_window_overflow
 from core.embedding_builder import (
@@ -31,10 +44,22 @@ from core.models import (
 from core.pipeline import (
     build_unified_text,
     enqueue_capture_processing,
+    extract_contexts,
     process_capture,
     sweep_stuck_captures,
 )
 from core.search import PREVIEW_CHARS, search_captures
+from core.storage import (
+    SupabaseStorage,
+    MediaIngestError,
+    extension_for,
+    fetchable_reference,
+    ingest_capture_media,
+    is_external_url,
+    media_object_path,
+    resolve_source,
+    screenshot_upload_to,
+)
 
 DIM = EXPECTED_DIMENSIONS  # what the provider is configured to produce (Matryoshka)
 
@@ -1476,3 +1501,798 @@ class SearchApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data, [])
         mock_search.assert_called_once_with(self.user, "anything", k=None, min_score=None)
+
+
+# ---------------------------------------------------------------------------
+# Media storage: Supabase bucket, local-disk fallback, ingest, capture flow
+# ---------------------------------------------------------------------------
+
+
+SUPABASE_ENV = {
+    "SUPABASE_URL": "https://proj.supabase.co",
+    "SUPABASE_SERVICE_KEY": "service-key",
+    "SUPABASE_BUCKET": "captures",
+    "MEDIA_PUBLIC": True,
+    "MEDIA_SIGNED_URL_TTL": 3600,
+}
+
+
+def _fake_get_response(content=b"x", status_code=200, content_type="image/jpeg"):
+    """A fake `requests` response for core.storage.download_capped."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.headers = {"Content-Type": content_type}
+    resp.iter_content = lambda chunk_size: iter([content])
+    return resp
+
+
+def _local_storage(tmp: str) -> FileSystemStorage:
+    return FileSystemStorage(location=tmp)
+
+
+def _isolated_media_root():
+    """Context manager: the *default* Django storage resolves to a
+    throwaway directory (and the lazy object is reset around it), so
+    file-backed tests never touch the repository's media/ directory."""
+    tmp = tempfile.mkdtemp(prefix="bm-media-")
+
+    @contextlib.contextmanager
+    def _ctx():
+        from django.core.files import storage as _dj_storage
+        from django.utils.functional import empty
+
+        with override_settings(MEDIA_ROOT=tmp):
+            # Re-resolve the default storage against this MEDIA_ROOT: the
+            # StorageHandler memoizes constructed backends, and the lazy
+            # object only re-runs _setup() when _wrapped is the `empty`
+            # sentinel (a `None` reset would just break it).
+            _dj_storage.storages._storages.clear()
+            _dj_storage.default_storage._wrapped = empty
+            try:
+                yield tmp
+            finally:
+                _dj_storage.storages._storages.clear()
+                _dj_storage.default_storage._wrapped = empty
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    return _ctx()
+
+
+def _png_data_uri() -> str:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+class StorageLayoutTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+
+    def test_media_object_path(self):
+        self.assertEqual(
+            media_object_path("cap1", "images", "i9", ".jpg"),
+            "cap1/images/i9.jpg",
+        )
+
+    def test_screenshot_upload_to_prefixes_capture_id(self):
+        capture = Capture(user=self.user)
+        self.assertEqual(
+            screenshot_upload_to(capture, "screenshot.png"),
+            f"{capture.capture_id}/screenshot.png",
+        )
+
+    def test_is_external_url(self):
+        self.assertTrue(is_external_url("https://example.com/a.jpg"))
+        self.assertTrue(is_external_url("http://example.com/a.jpg"))
+        self.assertFalse(is_external_url("cap1/images/i9.jpg"))
+        self.assertFalse(is_external_url(""))
+        self.assertFalse(is_external_url(None))
+
+    def test_extension_for(self):
+        self.assertEqual(extension_for("photo.JPG"), ".jpg")
+        self.assertEqual(extension_for("a.jpg?v=1"), ".jpg")  # query string stripped
+        self.assertEqual(extension_for(None, "video/mp4"), ".mp4")
+        self.assertEqual(extension_for("noext", "image/jpeg"), ".jpg")
+        self.assertEqual(extension_for("weird.xyz99999999", None), ".bin")
+        self.assertEqual(extension_for(None, None), ".bin")
+
+
+class FakeStorageAPI:
+    """In-test stand-in for the Supabase bucket object API (storage3)."""
+
+    def __init__(self):
+        self.objects: dict[str, tuple[bytes, dict]] = {}
+        self.removed: list[str] = []
+
+    def upload(self, path, file, file_options=None):
+        data = file.read() if hasattr(file, "read") else file
+        self.objects[path] = (data, dict(file_options or {}))
+        return {"path": path, "fullPath": f"bucket/{path}"}
+
+    def exists(self, path):
+        return path in self.objects
+
+    def download(self, path, options=None, query_params=None):
+        return self.objects[path][0]
+
+    def get_public_url(self, path, options=None):
+        return f"https://proj.supabase.co/storage/v1/object/public/bucket/{path}"
+
+    def create_signed_url(self, path, expires_in, options=None):
+        return {
+            "signedURL": (
+                f"https://proj.supabase.co/storage/v1/object/sign/{path}"
+                f"?token=t{expires_in}"
+            )
+        }
+
+    def remove(self, paths):
+        self.removed.extend(paths)
+        for path in paths:
+            self.objects.pop(path, None)
+        return []
+
+    def list(self, path=None, options=None):
+        prefix = f"{path}/" if path else ""
+        return [
+            {"name": name[len(prefix):]}
+            for name in self.objects
+            if name.startswith(prefix)
+        ]
+
+
+class FakeSupabaseClient:
+    """The `supabase` client shape core.storage uses: .storage.from_()."""
+
+    def __init__(self):
+        self.api = FakeStorageAPI()
+        holder = _StorageHolder(self.api)
+        self.storage = holder
+
+
+class _StorageHolder:
+    def __init__(self, api):
+        self._api = api
+
+    def from_(self, bucket):
+        return self._api
+
+
+@override_settings(**SUPABASE_ENV)
+class SupabaseStorageTests(TestCase):
+    def setUp(self):
+        self.fake_client = FakeSupabaseClient()
+        self.storage = SupabaseStorage(client=self.fake_client)
+
+    def test_requires_supabase_url(self):
+        with override_settings(SUPABASE_URL=""):
+            with self.assertRaises(ImproperlyConfigured):
+                SupabaseStorage(client=self.fake_client)
+
+    def test_save_uploads_with_content_type_and_upsert(self):
+        self.storage.save("cap1/images/a.jpg", ContentFile(b"img-bytes"))
+        data, options = self.fake_client.api.objects["cap1/images/a.jpg"]
+        self.assertEqual(data, b"img-bytes")
+        self.assertEqual(options["content-type"], "image/jpeg")
+        self.assertEqual(options["upsert"], "true")
+
+    def test_public_url(self):
+        self.assertEqual(
+            self.storage.url("cap1/screenshot.png"),
+            "https://proj.supabase.co/storage/v1/object/public/bucket/"
+            "cap1/screenshot.png",
+        )
+
+    @override_settings(MEDIA_PUBLIC=False, MEDIA_SIGNED_URL_TTL=123)
+    def test_signed_url_when_not_public(self):
+        # Constructed inside the override: public/ttl are read at init.
+        storage = SupabaseStorage(client=self.fake_client)
+        self.assertEqual(
+            storage.url("cap1/screenshot.png"),
+            "https://proj.supabase.co/storage/v1/object/sign/"
+            "cap1/screenshot.png?token=t123",
+        )
+
+    def test_exists_delete_open(self):
+        self.assertFalse(self.storage.exists("cap1/a.png"))
+        self.storage.save("cap1/a.png", ContentFile(b"x"))
+        self.assertTrue(self.storage.exists("cap1/a.png"))
+        with self.storage.open("cap1/a.png") as fh:
+            self.assertEqual(fh.read(), b"x")
+        self.storage.delete("cap1/a.png")
+        self.assertFalse(self.storage.exists("cap1/a.png"))
+        self.assertEqual(self.fake_client.api.removed, ["cap1/a.png"])
+
+    def test_list_prefix(self):
+        self.storage.save("cap1/screenshot.png", ContentFile(b"s"))
+        self.storage.save("cap1/images/a.jpg", ContentFile(b"a"))
+        self.storage.save("other/x.png", ContentFile(b"x"))
+        self.assertEqual(
+            sorted(self.storage.list_prefix("cap1")),
+            ["cap1/images/a.jpg", "cap1/screenshot.png"],
+        )
+
+
+class ResolveSourceTests(TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="bm-media-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = patch(
+            "core.storage.get_storage", return_value=_local_storage(self.tmp)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_bucket_path_resolves_to_local_path_in_fallback(self):
+        ref = resolve_source({"id": "i1", "url": "cap1/images/i1.jpg"})
+        self.assertEqual(
+            ref, os.path.join(self.tmp, "cap1/images/i1.jpg")
+        )
+
+    def test_external_url_passes_through(self):
+        source = {"id": "i1", "url": "https://origin.example/a.jpg"}
+        self.assertIs(resolve_source(source), source)
+
+    def test_bare_string(self):
+        self.assertEqual(
+            resolve_source("cap1/videos/v1.mp4"),
+            os.path.join(self.tmp, "cap1/videos/v1.mp4"),
+        )
+        self.assertEqual(
+            resolve_source("https://origin.example/a.jpg"),
+            "https://origin.example/a.jpg",
+        )
+
+    @override_settings(**SUPABASE_ENV)
+    def test_bucket_path_resolves_to_bucket_url_in_supabase_mode(self):
+        storage = SupabaseStorage(client=FakeSupabaseClient())
+        ref = resolve_source({"id": "i1", "url": "cap1/images/i1.jpg"}, storage=storage)
+        self.assertEqual(
+            ref,
+            "https://proj.supabase.co/storage/v1/object/public/bucket/"
+            "cap1/images/i1.jpg",
+        )
+
+
+class MediaIngestTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+        self.tmp = tempfile.mkdtemp(prefix="bm-media-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        storage_patcher = patch(
+            "core.storage.get_storage", return_value=_local_storage(self.tmp)
+        )
+        storage_patcher.start()
+        self.addCleanup(storage_patcher.stop)
+        get_patcher = patch("core.storage.requests.get")
+        get_patcher.start()
+        self.addCleanup(get_patcher.stop)
+        self.fake_get = get_patcher.start()
+
+    def _capture(self):
+        return Capture.objects.create(
+            user=self.user,
+            image_sources=[{"id": "i1", "url": "https://origin.example/a.jpg"}],
+            video_sources=[{"id": "v1", "url": "https://origin.example/big.mp4"}],
+        )
+
+    def test_stores_external_sources_and_rewrites_entries(self):
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(b"media")
+        capture = self._capture()
+
+        result = ingest_capture_media(capture)
+
+        self.assertIs(result, capture)
+        capture.refresh_from_db()
+        img, vid = capture.image_sources[0], capture.video_sources[0]
+        self.assertEqual(img["url"], f"{capture.capture_id}/images/i1.jpg")
+        self.assertEqual(img["original_url"], "https://origin.example/a.jpg")
+        self.assertEqual(vid["url"], f"{capture.capture_id}/videos/v1.mp4")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, img["url"])))
+        self.assertEqual(self.fake_get.call_count, 2)
+
+    def test_second_run_is_noop(self):
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(b"x")
+        capture = self._capture()
+
+        ingest_capture_media(capture)
+        self.fake_get.reset_mock()
+        ingest_capture_media(capture)
+
+        self.fake_get.assert_not_called()  # nothing re-downloaded
+
+    @override_settings(MEDIA_MAX_FILE_BYTES=10)
+    def test_oversized_source_is_kept_link_based(self):
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(b"x" * 100)
+        capture = self._capture()
+
+        ingest_capture_media(capture)  # must not raise
+
+        capture.refresh_from_db()
+        entry = capture.image_sources[0]
+        self.assertEqual(entry["url"], "https://origin.example/a.jpg")
+        # Assessed (original_url set) so a later run does not re-download.
+        self.assertEqual(entry["original_url"], "https://origin.example/a.jpg")
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, entry["url"])))
+
+    def test_download_failures_are_collected_and_raised(self):
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(
+            status_code=403
+        )
+        capture = self._capture()
+
+        with self.assertRaises(MediaIngestError) as ctx:
+            ingest_capture_media(capture)
+
+        message = str(ctx.exception)
+        self.assertIn("https://origin.example/a.jpg", message)
+        self.assertIn("https://origin.example/big.mp4", message)
+        self.assertIn("HTTP 403", message)
+
+        capture.refresh_from_db()
+        # Nothing was changed in the DB: a retry re-attempts both sources.
+        self.assertEqual(
+            capture.image_sources[0]["url"], "https://origin.example/a.jpg"
+        )
+        self.assertNotIn("original_url", capture.image_sources[0])
+
+    def test_mixed_outcomes_save_successes_then_raise(self):
+        def fake_get(url, **kw):
+            if url.endswith(".jpg"):
+                return _fake_get_response(b"img")
+            return _fake_get_response(status_code=404)
+
+        self.fake_get.side_effect = fake_get
+        capture = self._capture()
+
+        with self.assertRaises(MediaIngestError):
+            ingest_capture_media(capture)
+
+        capture.refresh_from_db()
+        # The successful download was stored ...
+        self.assertTrue(
+            capture.image_sources[0]["url"].startswith(str(capture.capture_id))
+        )
+        # ... while the failure stays external for the retry.
+        self.assertEqual(
+            capture.video_sources[0]["url"], "https://origin.example/big.mp4"
+        )
+
+    def test_noop_when_nothing_external(self):
+        capture = self._capture()
+        # Everything already stored / assessed: nothing for ingest to do.
+        capture.image_sources[0]["url"] = f"{capture.capture_id}/images/i1.jpg"
+        capture.image_sources[0]["original_url"] = "assessed"
+        capture.video_sources[0]["url"] = f"{capture.capture_id}/videos/v1.mp4"
+        capture.video_sources[0]["original_url"] = "assessed"
+        updated_before = Capture.objects.get(pk=capture.pk).updated_at
+
+        ingest_capture_media(capture)
+
+        self.fake_get.assert_not_called()
+        # No save at all: updated_at untouched.
+        self.assertEqual(Capture.objects.get(pk=capture.pk).updated_at, updated_before)
+
+
+@override_settings(**SUPABASE_ENV)
+class MediaIngestSupabaseModeTests(TestCase):
+    """Ingest against the real SupabaseStorage (fake client underneath)."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+        self.fake_client = FakeSupabaseClient()
+        storage_patcher = patch(
+            "core.storage.get_storage",
+            return_value=SupabaseStorage(client=self.fake_client),
+        )
+        storage_patcher.start()
+        self.addCleanup(storage_patcher.stop)
+        get_patcher = patch("core.storage.requests.get")
+        get_patcher.start()
+        self.addCleanup(get_patcher.stop)
+        self.fake_get = get_patcher.start()
+
+    def test_ingest_uploads_to_the_bucket(self):
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(b"img")
+        capture = Capture.objects.create(
+            user=self.user,
+            image_sources=[{"id": "i1", "url": "https://origin.example/a.jpg"}],
+        )
+
+        ingest_capture_media(capture)
+
+        name = f"{capture.capture_id}/images/i1.jpg"
+        self.assertEqual(self.fake_client.api.objects[name][0], b"img")
+        capture.refresh_from_db()
+        self.assertEqual(capture.image_sources[0]["url"], name)
+
+
+class CaptureMediaApiTests(APITestCase):
+    """POST /captures/ with the extended (multipart) media contract."""
+
+    def setUp(self):
+        self.user_a = get_user_model().objects.create_user(
+            "a", "a@example.com", "pw"
+        )
+        ctx = _isolated_media_root()
+        self.tmp_root = ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        patcher = patch("core.pipeline.async_task")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _capture_from_response(self, response) -> Capture:
+        return Capture.objects.get(
+            capture_id=uuid.UUID(response.data["capture_id"])
+        )
+
+    def test_json_only_client_contract_unchanged(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": ["some text"],
+                "media": {
+                    "images": [{"url": "https://origin.example/a.jpg"}],
+                    "videos": [{"url": "https://origin.example/v.mp4"}],
+                    "audios": [],
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        # Exactly today's shape: id + external url, no original_url key.
+        self.assertEqual(set(capture.image_sources[0].keys()), {"id", "url"})
+        self.assertEqual(
+            capture.image_sources[0]["url"], "https://origin.example/a.jpg"
+        )
+        self.assertEqual(
+            capture.video_sources[0]["url"], "https://origin.example/v.mp4"
+        )
+        # Django 5.2 wraps an unset FileField in a (falsy) FieldFile rather
+        # than leaving it None — assert falsiness, not None.
+        self.assertFalse(capture.screenshot)
+        # The source lists never reach the client (as before).
+        self.assertNotIn("image_sources", response.data)
+
+    def test_multipart_file_items_are_stored_at_creation(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": "some text",
+                "media": json.dumps(
+                    {
+                        "images": [
+                            {"url": "https://origin.example/a.jpg"},
+                            {"url": "https://origin.example/b.jpg"},
+                        ],
+                        "videos": [],
+                        "audios": [],
+                    }
+                ),
+                "file:images:0": SimpleUploadedFile(
+                    "a.jpg", b"image-bytes", content_type="image/jpeg"
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        stored, link = capture.image_sources
+
+        self.assertTrue(stored["url"].startswith(f"{capture.capture_id}/images/"))
+        self.assertTrue(stored["url"].endswith(".jpg"))
+        self.assertEqual(stored["original_url"], "https://origin.example/a.jpg")
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tmp_root, stored["url"]))
+        )
+        # The item with no paired file part stays exactly as today.
+        self.assertEqual(link["url"], "https://origin.example/b.jpg")
+        self.assertNotIn("original_url", link)
+
+    def test_file_over_per_file_cap_is_400(self):
+        self.client.force_authenticate(self.user_a)
+        with override_settings(MEDIA_MAX_FILE_BYTES=10):
+            response = self.client.post(
+                "/captures/",
+                {
+                    "media": json.dumps(
+                        {"images": [{"url": "https://o/a.jpg"}]}
+                    ),
+                    "file:images:0": SimpleUploadedFile(
+                        "a.jpg", b"x" * 100, content_type="image/jpeg"
+                    ),
+                },
+                format="multipart",
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Capture.objects.count(), 0)
+        self.assertEqual(os.listdir(self.tmp_root), [])  # nothing stored
+
+    def test_per_capture_total_cap_is_400(self):
+        self.client.force_authenticate(self.user_a)
+        with override_settings(
+            MEDIA_MAX_FILE_BYTES=10_000, MEDIA_MAX_TOTAL_PER_CAPTURE=150
+        ):
+            response = self.client.post(
+                "/captures/",
+                {
+                    "media": json.dumps(
+                        {"images": [{"url": "https://o/a.jpg"},
+                                    {"url": "https://o/b.jpg"}]}
+                    ),
+                    "file:images:0": SimpleUploadedFile(
+                        "a.jpg", b"x" * 100, content_type="image/jpeg"
+                    ),
+                    "file:images:1": SimpleUploadedFile(
+                        "b.jpg", b"y" * 100, content_type="image/jpeg"
+                    ),
+                },
+                format="multipart",
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Capture.objects.count(), 0)
+
+    def test_screenshot_is_uploaded_at_creation(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {"text": "some text", "image": _png_data_uri()},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertTrue(capture.screenshot)
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(self.tmp_root, capture.screenshot.name)
+            )
+        )
+        # The client gets a usable URL for the screenshot.
+        self.assertTrue(response.data["screenshot"])
+
+    def test_multipart_media_field_must_be_json(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/", {"media": "not-json"}, format="multipart"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Capture.objects.count(), 0)
+
+
+class MediaFakeProvider(FakeProvider):
+    """FakeProvider plus the media description calls the context phase
+    runs, recording the exact reference each call received."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.image_calls: list = []
+        self.video_calls: list = []
+        self.audio_calls: list = []
+
+    def describe_image(self, source):
+        self.image_calls.append(source)
+        return f"image of {source}"
+
+    def describe_video(self, source):
+        self.video_calls.append(source)
+        return f"video of {source}"
+
+    def transcribe_audio(self, source):
+        self.audio_calls.append(source)
+        return f"audio of {source}"
+
+
+class PipelineMediaPhaseTests(TestCase):
+    """The worker: claim -> processing_media -> context -> embeddings."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+        self.tmp = tempfile.mkdtemp(prefix="bm-media-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        storage_patcher = patch(
+            "core.storage.get_storage", return_value=_local_storage(self.tmp)
+        )
+        get_patcher = patch("core.storage.requests.get")
+        provider_patcher = patch("core.pipeline.GeminiProvider")
+        for patcher in (storage_patcher, get_patcher, provider_patcher):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.fake_get = get_patcher.start()
+        self.provider_cls = provider_patcher.start()
+
+    def _media_capture(self):
+        return Capture.objects.create(
+            user=self.user,
+            image_sources=[{"id": "i1", "url": "https://origin.example/a.jpg"}],
+            text_sources=["an article about red trucks"],
+        )
+
+    def test_process_capture_ingests_then_reaches_ready(self):
+        capture = self._media_capture()
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(b"img")
+        fake = MediaFakeProvider()
+        self.provider_cls.return_value = fake
+
+        process_capture(str(capture.capture_id))
+
+        capture.refresh_from_db()
+        self.assertEqual(capture.status, Capture.Status.READY)
+        self.assertIsNone(capture.error_note)
+        entry = capture.image_sources[0]
+        self.assertEqual(entry["url"], f"{capture.capture_id}/images/i1.jpg")
+        # The provider fetched the stored object, not the origin link.
+        self.assertEqual(
+            fake.image_calls, [os.path.join(self.tmp, entry["url"])]
+        )
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, entry["url"])))
+
+    def test_ingest_failure_marks_failed_and_lists_all_causes(self):
+        capture = Capture.objects.create(
+            user=self.user,
+            image_sources=[
+                {"id": "i1", "url": "https://origin.example/a.jpg"},
+                {"id": "i2", "url": "https://origin.example/b.png"},
+            ],
+        )
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(
+            status_code=403
+        )
+        self.provider_cls.return_value = MediaFakeProvider()
+
+        with self.assertRaises(MediaIngestError):
+            process_capture(str(capture.capture_id))
+
+        capture.refresh_from_db()
+        self.assertEqual(capture.status, Capture.Status.FAILED)
+        self.assertIn("MediaIngestError", capture.error_note)
+        self.assertIn("a.jpg", capture.error_note)
+        self.assertIn("b.png", capture.error_note)
+        self.assertFalse(
+            CaptureContext.objects.filter(capture_id=capture).exists()
+        )
+
+    def test_stale_processing_media_is_reclaimed_and_finished(self):
+        capture = self._media_capture()
+        capture.status = Capture.Status.PROCESSING_MEDIA
+        capture.save()
+        Capture.objects.filter(pk=capture.pk).update(
+            updated_at=timezone.now() - _stale_delta()
+        )
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(b"img")
+        self.provider_cls.return_value = MediaFakeProvider()
+
+        process_capture(str(capture.capture_id))
+
+        capture.refresh_from_db()
+        self.assertEqual(capture.status, Capture.Status.READY)
+
+    def test_fresh_processing_media_not_stolen(self):
+        capture = self._media_capture()
+        capture.status = Capture.Status.PROCESSING_MEDIA
+        capture.save()
+
+        self.provider_cls.return_value = MediaFakeProvider()
+        process_capture(str(capture.capture_id))
+
+        self.assertEqual(self.fake_get.call_count, 0)  # no work ran at all
+        self.assertFalse(
+            CaptureContext.objects.filter(capture_id=capture).exists()
+        )
+        capture.refresh_from_db()
+        self.assertEqual(capture.status, Capture.Status.PROCESSING_MEDIA)
+
+
+class ScreenshotResolutionTests(TestCase):
+    """The context phase's treatment of a stored (or missing) screenshot."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+        self.tmp = tempfile.mkdtemp(prefix="bm-media-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = patch(
+            "core.storage.get_storage", return_value=_local_storage(self.tmp)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _capture_with_screenshot(self, write_file: bool) -> Capture:
+        capture = Capture.objects.create(
+            user=self.user, text_sources=["an article about red trucks"]
+        )
+        name = f"{capture.capture_id}/screenshot.png"
+        if write_file:
+            path = os.path.join(self.tmp, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(b"png-bytes")
+        Capture.objects.filter(pk=capture.pk).update(screenshot=name)
+        capture.refresh_from_db()
+        return capture
+
+    def test_stored_screenshot_is_resolved_for_the_provider(self):
+        capture = self._capture_with_screenshot(write_file=True)
+        provider = MediaFakeProvider()
+
+        text, image, video, audio, summary = extract_contexts(capture, provider)
+
+        self.assertEqual(
+            provider.image_calls,
+            [os.path.join(self.tmp, capture.screenshot.name)],
+        )
+        self.assertEqual(len(image), 1)
+        self.assertEqual(image[0]["id"], str(capture.capture_id))
+
+    def test_missing_screenshot_is_skipped_not_failed(self):
+        capture = self._capture_with_screenshot(write_file=False)
+        provider = MediaFakeProvider()
+
+        text, image, video, audio, summary = extract_contexts(capture, provider)
+
+        self.assertEqual(provider.image_calls, [])  # nothing to describe
+        self.assertEqual(image, [])
+        # The rest of the capture still processed.
+        self.assertEqual(text, "summarized: an article about red trucks")
+
+
+class CaptureDeleteCleanupTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+        self.tmp = tempfile.mkdtemp(prefix="bm-media-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = patch(
+            "core.storage.get_storage", return_value=_local_storage(self.tmp)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write(self, relative: str):
+        path = os.path.join(self.tmp, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"x")
+        return path
+
+    def test_delete_removes_stored_media(self):
+        capture = Capture.objects.create(user=self.user)
+        capture_id = str(capture.capture_id)
+        self._write(f"{capture_id}/screenshot.png")
+        stored = self._write(f"{capture_id}/images/a.jpg")  # new layout
+        legacy = self._write("media/old.png")  # pre-per-capture-folder layout
+        # A legacy capture points its screenshot at the old media/ layout.
+        Capture.objects.filter(pk=capture.pk).update(screenshot="media/old.png")
+        capture.refresh_from_db()
+
+        deleted = capture.delete()
+
+        self.assertGreater(deleted[0], 0)
+        self.assertFalse(Capture.objects.filter(pk=capture.pk).exists())
+        # Everything under the capture prefix ...
+        self.assertFalse(os.path.exists(stored))
+        # ... and the legacy screenshot file are both gone.
+        self.assertFalse(os.path.exists(legacy))
+
+    def test_storage_failure_never_blocks_delete(self):
+        capture = Capture.objects.create(user=self.user)
+        with patch(
+            "core.storage.cleanup_capture_media", side_effect=RuntimeError("boom")
+        ):
+            deleted = capture.delete()
+        self.assertGreater(deleted[0], 0)
+        self.assertFalse(Capture.objects.filter(pk=capture.pk).exists())

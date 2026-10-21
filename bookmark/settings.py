@@ -325,3 +325,44 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
 
 MEDIA_ROOT = BASE_DIR / "media"
 MEDIA_URL = "/media/"
+
+# ------------------------------------------------------------------
+# Supabase Storage for captured media (see core/storage.py)
+#
+# When SUPABASE_URL is set, the default storage backend is Supabase
+# Storage: screenshots upload there at capture creation, and the
+# worker's media-ingest step stores downloaded images/videos/audio
+# under <capture_id>/ in the bucket. When it is NOT set (this
+# checkout, a bare dev machine, the offline test suite), every media
+# path falls back to local disk under MEDIA_ROOT with identical
+# behavior — the supabase package is never even contacted.
+# ------------------------------------------------------------------
+SUPABASE_URL = env.str("SUPABASE_URL", default="")
+SUPABASE_SERVICE_KEY = env.str("SUPABASE_SERVICE_KEY", default="")
+SUPABASE_BUCKET = env.str("SUPABASE_BUCKET", default="captures")
+# Development phase: public bucket (plain public URLs, no signing).
+# Flipping this to False switches url() to signed URLs — the pipeline
+# only ever asks for a URL, so nothing else changes.
+MEDIA_PUBLIC = env.bool("MEDIA_PUBLIC", default=True)
+MEDIA_SIGNED_URL_TTL = env.int("MEDIA_SIGNED_URL_TTL", default=3600)
+# The free storage plan caps a single upload at 50 MB; keep our own cap
+# at or below that. Media above the cap stays link-based (its original
+# URL is the source of truth), so the cap only gates what we STORE.
+MEDIA_MAX_FILE_BYTES = env.int("MEDIA_MAX_FILE_BYTES", default=50 * 1024 * 1024)
+# Free plan includes 1 GB total; one capture must not be able to eat a
+# large share of it.
+MEDIA_MAX_TOTAL_PER_CAPTURE = env.int("MEDIA_MAX_TOTAL_PER_CAPTURE", default=200 * 1024 * 1024)
+MEDIA_DOWNLOAD_TIMEOUT = env.float("MEDIA_DOWNLOAD_TIMEOUT", default=60.0)
+
+STORAGES = {
+    "default": {
+        "BACKEND": (
+            "core.storage.SupabaseStorage"
+            if SUPABASE_URL
+            else "django.core.files.storage.FileSystemStorage"
+        ),
+    },
+    "staticfiles": {
+        "BACKEND": "django.core.files.staticfiles.storage.StaticFilesStorage",
+    },
+}

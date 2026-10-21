@@ -1,10 +1,16 @@
 from datetime import datetime
 
+import logging
+
 from pgvector.django import VectorField
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
 import uuid
+
+from core.storage import screenshot_upload_to
+
+logger = logging.getLogger(__name__)
 
 
 # Create your models here.
@@ -12,13 +18,14 @@ import uuid
 class Capture(models.Model):
     class Status(models.TextChoices):
         # The client-facing state machine for the background pipeline:
-        #   (queued) -> pending -> processing_context ->
+        #   (queued) -> pending -> processing_media -> processing_context ->
         #   processing_embeddings -> ready | failed
         # `queued` sits before `pending` for captures whose user is over
         # the per-user in-flight cap (see CAPTURE_INFLIGHT_LIMIT); the
         # worker's startup sweep promotes them as slots free up.
         QUEUED = "queued", "Queued"
         PENDING = "pending", "Pending"
+        PROCESSING_MEDIA = "processing_media", "Processing media"
         PROCESSING_CONTEXT = "processing_context", "Processing context"
         PROCESSING_EMBEDDINGS = "processing_embeddings", "Processing embeddings"
         READY = "ready", "Ready"
@@ -26,7 +33,10 @@ class Capture(models.Model):
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete = models.CASCADE, related_name = 'captures')
     capture_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    screenshot = models.ImageField(upload_to='media/', null=True, blank=True)
+    # Every media file of a capture lives under its <capture_id>/ prefix in
+    # the storage backend (core.storage): Supabase Storage when configured,
+    # local disk otherwise (core.storage.screenshot_upload_to).
+    screenshot = models.ImageField(upload_to=screenshot_upload_to, null=True, blank=True)
     image_sources = models.JSONField(null=True, blank=True, default=list)
     video_sources = models.JSONField(null=True, blank=True, default=list)
     audio_sources = models.JSONField(null=True, blank=True, default=list)
@@ -44,6 +54,42 @@ class Capture(models.Model):
         indexes = [
             models.Index(fields=["status", "updated_at"])
         ]
+
+    def delete(self, using=None, keep_parents=False):
+        """Delete the row, then best-effort remove the capture's stored
+        media (the whole <capture_id>/ prefix, plus a legacy screenshot
+        file if it predates the per-capture layout).
+
+        Storage problems never block or fail the database delete — they
+        are logged. (QuerySet.delete() bulk paths bypass this hook; the
+        single-object ORM delete is what the app, admin, and eval tooling
+        use.)
+        """
+        # Both values must be read BEFORE super().delete(): Django's
+        # Collector wipes the pk (and the delete invalidates the row) on
+        # the instance, so anything read after would be gone.
+        capture_id = self.capture_id
+        legacy_screenshot_name = self.screenshot.name if self.screenshot else None
+        deleted = super().delete(using=using, keep_parents=keep_parents)
+        # Django 5.2: delete() returns (count, {label: count}); unpack the
+        # count (a plain dict on older versions would break this unpack).
+        deleted_count = (
+            deleted[0] if isinstance(deleted, tuple) else sum(deleted.values())
+        )
+        if deleted_count:
+            try:
+                from core import storage as media_storage
+
+                media_storage.cleanup_capture_media(
+                    capture_id, legacy_screenshot_name=legacy_screenshot_name
+                )
+            except Exception:
+                logger.warning(
+                    "media cleanup failed for capture %s",
+                    capture_id,
+                    exc_info=True,
+                )
+        return deleted
 
 
 
