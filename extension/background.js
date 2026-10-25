@@ -29,25 +29,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // ===========================
-// ATTACH NOTE
-// ===========================
-
-chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
-    if (message.type !== "ATTACH_NOTE") return false;
-
-    const { bookmark_id, note } = message.data || {};
-    if (!bookmark_id || !note) return false;
-
-    fetch(`http://127.0.0.1:8080/retrieve/bookmarks/${bookmark_id}/note/`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ note }),
-    }).catch((err) => console.error("ATTACH_NOTE failed:", err));
-
-    return false; // fire-and-forget
-});
-
-// ===========================
 // ROUTER
 // ===========================
 
@@ -58,12 +39,6 @@ async function handleSave(platform, payload, sendResponse) {
                 await handleYouTube(payload, sendResponse);
                 break;
             case "twitter":
-                // NOTE: handleTwitter (FormData + blob upload) is intentionally NOT
-                // used yet. The backend capture view only parses JSON (json.loads on
-                // request.body) and has no file/image storage, so multipart POSTs 400.
-                // Two more changes are needed before switching: (1) backend multipart +
-                // media storage, (2) fix handleTwitter to read
-                // payload.platform_specific_data.images (not payload.images).
                 await handleGeneric(payload, sendResponse);
                 break;
             case "linkedin":
@@ -86,31 +61,6 @@ async function handleSave(platform, payload, sendResponse) {
 async function handleYouTube(payload, sendResponse) {
     // YouTube was already working — plain JSON POST, no media download
     await postJSON("http://127.0.0.1:8080/capture/save/", payload, sendResponse);
-}
-
-async function handleTwitter(payload, sendResponse) {
-    // Download images the extension can reach (pbs.twimg.com — no auth needed).
-    // Videos are HLS streams; we pass tweetUrl and let the backend use yt-dlp.
-    const formData = new FormData();
-    formData.append("tweet_data", JSON.stringify(payload));
-
-    if (payload.images?.length) {
-        console.group("Downloading tweet images");
-
-        for (let i = 0; i < payload.images.length; i++) {
-            const blob = await downloadMedia(payload.images[i]);
-            if (blob) {
-                formData.append("images", blob, `image_${i}.jpg`);
-                console.log(`image_${i}:`, blob.size, blob.type);
-            } else {
-                console.warn(`image_${i} download failed, skipping`);
-            }
-        }
-
-        console.groupEnd();
-    }
-
-    await postFormData("http://127.0.0.1:8080/capture/save/", formData, sendResponse);
 }
 
 async function handleGeneric(payload, sendResponse) {
@@ -136,45 +86,10 @@ async function postJSON(url, payload, sendResponse) {
             sendResponse({ status: "OK", data });
         } else {
             console.error("Backend error:", response.status, data);
-            sendResponse({
-                status: "ERROR",
-                code: response.status,
-                error: data,
-                setupRequired: response.status === 503 && !!data?.message,
-                message: data?.message,
-            });
+            sendResponse({ status: "ERROR", code: response.status, error: data });
         }
     } catch (err) {
         console.error("postJSON failed:", err);
-        sendResponse({ status: "FETCH_ERROR", error: err.message });
-    }
-}
-
-async function postFormData(url, formData, sendResponse) {
-    try {
-        // Do NOT set Content-Type manually — browser sets it with the boundary
-        const response = await fetch(url, {
-            method: "POST",
-            body: formData,
-        });
-
-        const data = await response.json();
-
-        if (response.ok) {
-            console.log("FormData POST success:", data);
-            sendResponse({ status: "OK", data });
-        } else {
-            console.error("Backend error:", response.status, data);
-            sendResponse({
-                status: "ERROR",
-                code: response.status,
-                error: data,
-                setupRequired: response.status === 503 && !!data?.message,
-                message: data?.message,
-            });
-        }
-    } catch (err) {
-        console.error("postFormData failed:", err);
         sendResponse({ status: "FETCH_ERROR", error: err.message });
     }
 }

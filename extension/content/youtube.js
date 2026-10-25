@@ -128,9 +128,6 @@ function injectSaveButton() {
                 if (!chrome.runtime.lastError && response?.status === "OK") {
                     bmSetState(newBtn, "saved");
                     window.bmShowConfirmation(response.data?.bookmark_id);
-                } else if (response?.setupRequired) {
-                    bmSetState(newBtn, "error");
-                    window.bmShowSetupRequired(response.message);
                 } else {
                     bmSetState(newBtn, "error", window.bmErrorMessage(response));
                     window.bmShowError(response);

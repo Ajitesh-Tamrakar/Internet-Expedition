@@ -394,9 +394,6 @@ function injectButton(post, index) {
             if (response?.status === "OK") {
                 bmSetState(btn, "saved");
                 window.bmShowConfirmation(response.data?.bookmark_id);
-            } else if (response?.setupRequired) {
-                bmSetState(btn, "error");
-                window.bmShowSetupRequired(response.message);
             } else {
                 bmSetState(btn, "error", window.bmErrorMessage(response));
                 window.bmShowError(response);
