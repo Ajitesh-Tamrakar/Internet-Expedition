@@ -35,14 +35,8 @@
                 "<all_urls>"
             ],
             "js": [
-                "content/readability-core.js",
-                "content/readability-utils.js",
-                "content/readability-predicates.js",
-                "content/readability-metadata.js",
-                "content/readability-preprocess.js",
-                "content/readability-postprocess.js",
-                "content/readability-scoring.js",
-                "content/readability-parse.js",
+                "vendor/readability/Readability.js",
+                "vendor/readability/Readability-readerable.js",
                 "content/confirmation.js",
                 "content/universal.js"
             ],
