@@ -78,12 +78,37 @@ GEMINI_SUMMARY_MODEL = env.str("GEMINI_SUMMARY_MODEL", default="gemini-3.5-flash
 GEMINI_EMBED_MODEL = env.str("GEMINI_EMBED_MODEL", default="gemini-embedding-2")
 
 ALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=['localhost', '127.0.0.1'])#type: ignore
-CORS_ALLOW_ALL_ORIGINS = True
-CORS_ALLOW_CREDENTIALS = True  # the HttpOnly refresh cookie may cross origins
+
+# ------------------------------------------------------------------
+# CORS (B0 — auth tightening, impl doc §5.1; rework doc §4)
+#
+# One allowlist: the extension origin (derived from the committed
+# manifest key in extension/manifest.json — SHA-256 of the public key,
+# first 16 bytes, hex → letters a–p — the stable ID every install gets),
+# plus the two vite dev origins the local frontend needs: its login
+# flow is cross-origin same-site, and the confirm response's Set-Cookie
+# is only honored when the response reflects that origin (Flag §6-6).
+# The same-origin production frontend (WhiteNoise, parked §8-P2) needs
+# no entry. The v1-era entries (the dead :8081 UI, the throwaway v1
+# extension ID that never came from a committed key — Flag §6-2) are
+# gone.
+#
+# CORS_ALLOW_CREDENTIALS stays on — the HttpOnly refresh cookie must
+# cross origins for the extension's derive call (M4).
+#
+# CORS_ALLOW_ALL_ORIGINS is DEBUG-gated, not a production posture: with
+# the refresh as a cross-site cookie, an all-origins credentialed echo
+# is token theft from any website (rework §4: "must not survive"). In
+# debug it keeps local dev painless; in production only the list above
+# is trusted.
+# ------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:8081",
-    "chrome-extension://neoepajlbbhfoelekkmipdhpaklbbgac",
+    "chrome-extension://clkincbmeekldgkilbeifchiigclhbch",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ]
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_ALL_ORIGINS = DEBUG
 # Application definition
 
 INSTALLED_APPS = [
@@ -161,8 +186,13 @@ REST_AUTH = {
     'JWT_AUTH_REFRESH_COOKIE_PATH': '/api/auth/',
     # Plain-HTTP dev stays testable; production (DEBUG off) sends Secure.
     'JWT_AUTH_SECURE': not DEBUG,
-    # Set JWT_AUTH_SAMESITE=None in .env only if the frontend calls the API
-    # cross-origin (same-origin/vite-proxy works fine with Lax).
+    # SameSite baseline is Strict — set explicitly in .env (absent from
+    # .env it would resolve to Lax; the two behave identically for the
+    # extension's call, so Strict is the honest baseline). The M4
+    # SameSite probe decides whether Chrome actually sends the cookie on
+    # the extension's cross-site fetches; a None flip (the probe's
+    # option (a) only) lands here, *after* the CORS hardening above —
+    # it is never the first step.
     'JWT_AUTH_SAMESITE': env.str("JWT_AUTH_SAMESITE", default="Lax"),
 }
 
@@ -313,10 +343,6 @@ STATIC_URL = 'static/'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
-
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:8081",
-]
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
