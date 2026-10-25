@@ -106,8 +106,6 @@ function injectSaveButton() {
             const mandatory_fields = {
                 source_url: videoUrl,
                 platform: 'youtube',
-                content_type: 'video',
-                capture_method: 'Platform_injection',
             };
 
             const platform_specific_data = {

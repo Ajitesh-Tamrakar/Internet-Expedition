@@ -89,8 +89,6 @@ function extractTweet(tweet) {
     const mandatory_fields = {
         source_url,
         platform: "twitter",
-        content_type: { 'image': true, 'video': false, 'text': true },
-        capture_method: "platform_injection",
     };
     const platform_specific_data = {
         tweetId,

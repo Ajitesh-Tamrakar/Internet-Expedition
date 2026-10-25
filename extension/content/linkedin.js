@@ -268,20 +268,10 @@ function extractLinkedInPost(post) {
             ) ||
         "";
 
-    // Media Type
-    let content_type = { "text": true, 'image': false, 'video': false };
-    if (videos.length) {
-        content_type["video"] = true;
-    } else if (images.length) {
-        content_type["image"] = true;
-    }
-
     source_url = post_url;
     const mandatory_fields = {
         source_url,
-        platform: "linkedin",
-        content_type,
-        capture_method: "platform_injection"
+        platform: "linkedin"
     };
 
     const platform_specific_data = {

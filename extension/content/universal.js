@@ -59,7 +59,6 @@ function extractWebPage(selectionText, screenshotBase64) {
     mandatory_fields: {
       source_url:     location.href,
       platform:       "web",
-      capture_method: "context_menu",
     },
     platform_specific_data: {
       text_content:       (text ?? "").trim(),
