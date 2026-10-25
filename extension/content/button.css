@@ -1,0 +1,76 @@
+/* Bookmark cross-platform save button — visual layer only.
+   Scoped to .bm-* classes; does not style any host-page element. */
+
+.bm-btn {
+  -webkit-appearance: none;
+  appearance: none;
+  border: none;
+  background: none;
+  margin: 0;
+  font: inherit;
+  cursor: pointer;
+  color: inherit;               /* idle ribbon color resolves from here via currentColor */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.bm-btn:focus { outline: none; }
+.bm-btn:focus-visible { outline: 2px solid #EF9F27; outline-offset: 2px; }
+
+.bm-icon-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: background-color 150ms ease;
+}
+.bm-ribbon { stroke: currentColor; transition: stroke 150ms ease, fill 150ms ease; }
+.bm-dot { transition: fill 150ms ease; }
+
+/* hover: amber tint behind icon (identical across platforms) */
+.bm-btn:hover .bm-icon-wrap { background: rgba(239,159,39,0.12); }
+
+/* states (prefixed bm- to avoid colliding with host-page .saved / .saving) */
+.bm-btn.bm-saving { opacity: 0.6; }
+.bm-btn.bm-saved .bm-ribbon { fill: #EF9F27; stroke: #EF9F27; }
+.bm-btn.bm-saved .bm-dot { fill: #1a1a1a; }
+.bm-btn.bm-error .bm-ribbon { stroke: #E24B4A; }
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes bm-pulse {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.22); }
+    100% { transform: scale(1); }
+  }
+  .bm-btn.bm-pulse { animation: bm-pulse 350ms ease-out; }
+}
+
+/* ---- YouTube: cloned YT pill; ribbon inherits YT's own white icon color ---- */
+.bm-btn--youtube .bm-icon-wrap { width: 24px; height: 24px; }
+.bm-btn--youtube:hover .bm-icon-wrap { background: transparent; } /* YT pill provides its own hover */
+
+/* ---- X (Twitter) ---- */
+.bm-btn--x { color: #71767b; }
+.bm-btn--x .bm-icon-wrap { width: 34px; height: 34px; }
+
+/* ---- Pinterest: white circular icon button ---- */
+.bm-btn--pinterest {
+  background: #fff;
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  border: 1px solid rgba(0,0,0,0.12);
+  color: #3a3a3a;
+}
+.bm-btn--pinterest:hover { background: #f0f0f0; }
+.bm-btn--pinterest .bm-icon-wrap { width: 24px; height: 24px; }
+
+/* ---- LinkedIn: icon-only, matches the Like/Comment/Repost/Send row size ---- */
+.bm-btn--linkedin {
+  padding: 8px;
+  border-radius: 50%;
+  color: rgba(0,0,0,0.6);
+  transition: background-color 150ms ease, color 150ms ease;
+}
+.bm-btn--linkedin:hover { background: #f3f2ef; color: #EF9F27; }
+.bm-btn--linkedin:hover .bm-icon-wrap { background: transparent; }
+.bm-btn--linkedin .bm-icon-wrap { width: 19px; height: 19px; }
