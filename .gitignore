@@ -22,3 +22,6 @@ ds-bundle/
 
 # Local planning docs
 planning_docs/
+
+# Extension
+extension/.dev-load/

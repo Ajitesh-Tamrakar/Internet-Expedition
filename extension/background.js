@@ -1,4 +1,17 @@
 // ===========================
+// CONFIG
+// ===========================
+
+// The one API origin — the pinned SaaS origin. It is a project constant
+// (impl doc Flag §6-9: it appears in a handful of places that must not
+// drift — the manifest's host_permissions, the relay entry, the
+// exclude_matches, this default, and the backend's CORS allowlist;
+// any change is a single coordinated commit). The dev load dir built by
+// dev/manifest-dev.sh substitutes this value with the local origin, so
+// the same background.js serves both manifests.
+const API_BASE_URL = "https://internetexpedition.ajiteshtamrakar.com";
+
+// ===========================
 // PLATFORM DETECTION
 // ===========================
 
@@ -60,11 +73,11 @@ async function handleSave(platform, payload, sendResponse) {
 
 async function handleYouTube(payload, sendResponse) {
     // YouTube was already working — plain JSON POST, no media download
-    await postJSON("http://127.0.0.1:8080/capture/save/", payload, sendResponse);
+    await postJSON(`${API_BASE_URL}/captures/`, payload, sendResponse);
 }
 
 async function handleGeneric(payload, sendResponse) {
-    await postJSON("http://127.0.0.1:8080/capture/save/", payload, sendResponse);
+    await postJSON(`${API_BASE_URL}/captures/`, payload, sendResponse);
 }
 
 // ===========================

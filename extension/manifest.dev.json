@@ -1,0 +1,109 @@
+{
+    "manifest_version": 3,
+    "name": "Internet Expedition",
+    "version": "1.0",
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp+EuSxUPvRAIwfcs1T516mOxk9TR+J/aVsi7KqeUQ5ueVUk9wOOK/Rq2Dd+PJZsQg58F8PshJvwpUCl08Zydhlb07AVkerSuCzpzzBCf/8FSpdEwJuAL8o2K2DgkK/uQzdJ8hbWHH0h3rVnEBUiCEq42yMnqEOvrOx4IMmk19q9cbePRckQqiCGZkhXQcHgAQtFxLTBvurhFbgy1uS4/4QtEf5YkvIpWmDl5Krl9A1Z3OOQGH19OpiYNVPqe1ZWWDxTayVlQLmNcXuQOSSnZSihoPTuIsEzhv+zlDgjuWHstCOCKlU0q+MIr1KaVpBpCo6f1Jv722AQCKfulDKxYkwIDAQAB",
+    "action": {
+        "default_popup": "popup/popup.html",
+        "default_icon": {
+            "16": "icons/icon16.png",
+            "32": "icons/icon32.png",
+            "48": "icons/icon48.png",
+            "128": "icons/icon128.png"
+        }
+    },
+    "permissions": [
+        "activeTab",
+        "contextMenus",
+        "storage"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "host_permissions": [
+        "http://localhost:8080/*"
+    ],
+    "content_scripts": [
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "exclude_matches": [
+                "http://localhost:5173/*"
+            ],
+            "js": [
+                "vendor/readability/Readability.js",
+                "vendor/readability/Readability-readerable.js",
+                "content/confirmation.js",
+                "content/universal.js"
+            ],
+            "css": [
+                "content/confirmation.css"
+            ]
+        },
+        {
+            "matches": [
+                "https://*.x.com/*",
+                "https://*.twitter.com/*"
+            ],
+            "js": [
+                "content/twitter.js"
+            ],
+            "css": [
+                "content/button.css"
+            ]
+        },
+        {
+            "matches": [
+                "https://*.pinterest.com/*"
+            ],
+            "js": [
+                "content/pinterest.js"
+            ],
+            "css": [
+                "content/button.css"
+            ]
+        },
+        {
+            "matches": [
+                "https://*.youtube.com/*"
+            ],
+            "js": [
+                "content/youtube.js"
+            ],
+            "css": [
+                "content/button.css"
+            ]
+        },
+        {
+            "matches": [
+                "https://www.linkedin.com/*"
+            ],
+            "js": [
+                "content/early.js"
+            ],
+            "run_at": "document_start"
+        },
+        {
+            "matches": [
+                "https://*.linkedin.com/*"
+            ],
+            "js": [
+                "content/linkedin.js"
+            ],
+            "css": [
+                "content/button.css"
+            ]
+        }
+    ],
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "inject.js"
+            ],
+            "matches": [
+                "https://www.linkedin.com/*"
+            ]
+        }
+    ]
+}
