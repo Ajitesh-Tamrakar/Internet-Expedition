@@ -19,3 +19,6 @@ media/
 .ds-sync/
 ds-bundle/
 .design-sync/
+
+# Local planning docs
+planning_docs/
