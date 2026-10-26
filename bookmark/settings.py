@@ -84,7 +84,10 @@ ALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=['localhost', '127.0.0.
 #
 # One allowlist: the extension origin (derived from the committed
 # manifest key in extension/manifest.json — SHA-256 of the public key,
-# first 16 bytes, hex → letters a–p — the stable ID every install gets),
+# first 16 bytes, hex → letters a–p — the stable ID every install gets).
+# Verified against the loaded extension's chrome.runtime.id in a real
+# browser (2026-10-26, M2 acceptance) — that check is the guard: an ID
+# derived only on paper could be wrong (it was, once).
 # plus the two vite dev origins the local frontend needs: its login
 # flow is cross-origin same-site, and the confirm response's Set-Cookie
 # is only honored when the response reflects that origin (Flag §6-6).
@@ -103,7 +106,7 @@ ALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=['localhost', '127.0.0.
 # is trusted.
 # ------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = [
-    "chrome-extension://clkincbmeekldgkilbeifchiigclhbch",
+    "chrome-extension://oijkpjikiabildophmlfeihojjpghmed",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
