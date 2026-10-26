@@ -116,3 +116,117 @@ The harness (`/private/var/folders/…/T/opencode/smoke/smoke.js`, scratch — n
 Prerequisite: only M1 (done). Nothing else is due.
 
 ---
+
+## M2 — Extension core architecture: identity, floor, dev environment, B0 — ✅ completed 2026-10-26
+
+**Session:** 2026-10-26 (completed same day). All six tasks landed; every acceptance item — including the real-browser run — has an actual recorded result in §6.
+**Branch:** `extension/rework`; M1 set was the clean base. M2 commits: `77709d6` (identity + manifest step + `api_base_url` + dev manifest + dev script) → `57c33c7` (worker floor) → `b4ff40d` (B0) → `067770a` (B0 fix — the allowlist's extension origin was a derivation error; the browser-verified ID) → docs (this entry + board).
+
+### 1. Current milestone — objective
+
+Make the extension a real floor: a **stable identity** (committed RSA key → fixed extension ID), a **worker pointed at a backend** (config + storage accessors), the **message bus** plumbing with SAVE migrated onto it (handler body stays v1-shaped), the **context-menu origin guard**, a **local development environment** (dev manifest + script) for same-origin credentialed testing in M4+, and the backend's **CORS hardening (B0)** — all verifiable without the deployed origin (which is NXDOMAIN — see §8/§9).
+
+### 2. Tasks attempted (impl doc M2 scope, M2.1–M2.6)
+
+| # | Task | Status |
+|---|---|---|
+| M2.1 | RSA keypair generated **once**; public key (392-char base64 DER SPKI) committed as `key` in both manifests; stable ID = **`oijkpjikiabildophmlfeihojjpghmed`** (SHA-256 of the public-key **DER bytes**, first 16 bytes, hex nibbles → a–p). A previous session had recorded a *different* ID for the same key — a derivation bug (see §8); the real-browser `chrome.runtime.id` is the ground truth and settles it | ✅ done — static **and real browser** (C1, §6) |
+| M2.2 | SaaS manifest step (atomic: pinned origin only, v1 patterns retire, `scripting` + `icons/*` WAR drop, `exclude_matches` added, no relay entry) + `manifest.dev.json` (same key, local origins) + `dev/manifest-dev.sh` (builds gitignored load dir; `IE_API_ORIGIN`/`IE_VITE_ORIGIN` overrides; SaaS manifest byte-identity md5-verified) | ✅ done |
+| M2.3 | Worker config/storage: `API_BASE_URL` constant block; `getApiBaseUrl()` (storage-first → constant, wake-cached); `getAccessToken()`/`setAccessToken()` (null removes the key; presence = signed in; no callers yet — M4); merged `onInstalled` (seed `api_base_url` **only if absent** + context menu) | ✅ done |
+| M2.4 | `listen(type, handler)` bus wrapper; SAVE migrated onto it — handler body **v1-shaped** (`detectPlatform` + adapter router + `postJSON` survive); endpoint → `{api_base_url}/captures/`; `lastError` voided on fire-and-forget send | ✅ done |
+| M2.5 | Context-menu origin guard (`tab?.url && tab.url.startsWith(api_base_url)` → return; missing tab/url degrades safely) | ✅ done |
+| M2.6 | **B0** — `bookmark/settings.py`: one deduped `CORS_ALLOWED_ORIGINS` [ext ID, `http://localhost:5173`, `http://127.0.0.1:5173`] (v1 `:8081` + throwaway v1 ID out; the shadowed duplicate declaration removed); `CORS_ALLOW_ALL_ORIGINS = DEBUG`; `CORS_ALLOW_CREDENTIALS` kept; stale `JWT_AUTH_SAMESITE` comment reworded; `.env`: `JWT_AUTH_SAMESITE=Strict` (gitignored file — resolves via settings' own environ path) | ✅ done |
+
+### 3. Files changed, and why
+
+| File | Why |
+|---|---|
+| `extension/manifest.json` | +`key` (stable identity); `host_permissions` = pinned SaaS origin only (7 v1 patterns retire in the same edit); `content_scripts` `exclude_matches`; `icons` `/*` WAR drop (5 PNGs keep the map working); `scripting` dropped |
+| `extension/manifest.dev.json` (new) | local-origins twin, **same key**; identical in every other field (audited) |
+| `extension/background.js` | the worker floor: constant block, 3 accessors, merged `onInstalled`, `listen()` + SAVE migration, origin guard. Every *kept* v1 line byte-identical (line-multiset check vs M1) |
+| `bookmark/settings.py` | B0 — the CORS block (above) |
+| `dev/manifest-dev.sh` (new) | dev load-dir builder (tar-based; self-recursion excluded; overrides; sanity greps) |
+| `.gitignore` | +`extension/.dev-load/` |
+| `.env` (gitignored, local-only) | +`JWT_AUTH_SAMESITE=Strict` |
+
+### 4. Important functions / modules (post-M2 state)
+
+- **`background.js`** — `API_BASE_URL` (per-manifest constant; dev build substitutes the local origin at load-dir time) · `getApiBaseUrl()` / `getAccessToken()` / `setAccessToken()` (the two storage keys; `api_base_url` seeded only if absent) · `onInstalled` (one listener) · `listen(type, handler)` (type-first; handler owns `sendResponse`) · SAVE handler (v1-shaped: `detectPlatform` → 5-way `switch` → `postJSON` to `{api_base_url}/captures/`) · context-menu click (origin guard first) · `bmShow*`/`bmRetry`/`bmSendError`/`bmSendMessage` (byte-identical) · `downloadMedia` (byte-identical).
+- **`bookmark/settings.py`** — B0 block per §2 M2.6; `JWT_AUTH_SAMESITE` default in code stays `Lax` (the comment now says: start `Strict`; M4 probe decides; a `None` flip lands after B0, never before).
+
+### 5. Design & implementation decisions
+
+- **One key, two manifests.** The same `key` in SaaS + dev: one identity across environments; the two files differ **only** in the two origin fields. Dev never touches the committed SaaS manifest (the script verifies md5 before/after).
+- **`detectPlatform` kept in M2** — the impl doc's *end-state inventory* marks it "M2", but the milestone spec's "handler body stays v1-shaped" is the nearer instruction; the M5 router collapse is where rework finding 4 applies. Behavior-neutral (the router still dispatches on it).
+- **Key custody (owner's call):** offered 1Password first; the owner chose "you keep it in your memory — you're running locally". It sat at `/private/var/folders/…/T/opencode/ie-ext-key/priv.pem` (chmod 600) + was placed on the clipboard for the owner's own copy. Never in the repo, any commit, or any doc. **Losing event (2026-10-26):** a machine restart purged the scratch dir and the clipboard; a full search (Spotlight, home-dir sweep, all 1375 git objects) found no surviving copy — **the private key is gone**. Impact: *local* development is unaffected — Chrome derives the ID from the **public** key in the manifest (the browser-verified `oijkp…` above), so every local load, the CORS entry, and all of M2–M8 stand. What the loss costs is only the **Chrome Web Store** association (publishing under that ID) — a store decision is not in M1–M8; if the owner ever wants the store, a one-time key regeneration → new ID → one coordinated commit (manifest key + CORS entry, the Flag §6-9 five-place rule) is the resolution.
+- **Dev load dir inside `extension/`** (`.dev-load`, gitignored) — reproducible via the script; the tar exclusion makes self-recursion impossible (a first `cp -R` attempt found the bug).
+- **Docker for the test DB** (owner-approved): the `.env`'s Supabase host no longer resolves from this machine; an ephemeral `pgvector/pgvector:pg16` container (`ie-test-db`, `127.0.0.1:5433`, db `bookmark`, vector 0.8.7) + `DB_*` env overrides (the AGENTS.md-sanctioned pattern) — **no project DB config changed**.
+
+### 6. Tests / checks run — actual results
+
+**Static battery (all passed, 2026-10-26):** both manifests parse; identical `key`; SaaS = pinned origin only (no localhost patterns); dev = local origins; `exclude_matches` in both; no `scripting` / no `icons/*` WAR / no relay anywhere; dev-vs-prod diff = the two origin fields only. `node --check` on every JS incl. vendor: clean. `bash -n` on the dev script: ok. Kept-lines multiset vs M1: every unchanged v1 line byte-identical — only the intended edits. Orphan grep: both dead `:8080` literals gone; survivors = the documented "Bookmark" strings + `bookmark_id` reads (M5/M7 rename) + intentional dev-manifest local origins + gitignored load-dir copies. ID derived from the committed manifest = **`oijkpjikiabildophmlfeihojjpghmed`** (computed over the base64-decoded DER bytes); dev manifest key identical; **confirmed in a real browser** (`chrome.runtime.id` in the loaded extension, §6) — which is how the earlier on-paper derivation error was caught.
+
+**Environment fix (no project change):** the venv predated `django-q2==1.11.1` + `supabase==2.33.0` (`ModuleNotFoundError: django_q` on startup) — installed at the pinned versions; backend + suite then import fine.
+
+**Django suite: `Ran 117 tests in 10.9 s — OK`** (against the Docker pgvector container; `DB_*` overrides as in §5).
+
+**Backend sanity on `:8080`:** unauthenticated `GET /captures/` → **401** `{"detail":"Authentication credentials were not provided."}` ✅
+
+**CORS battery — one-off `DEBUG=0` server, real curls (actual response headers); re-run 2026-10-26 against the *corrected* allowlist:**
+
+| Request | `Access-Control-Allow-Origin` | Credentials | Preflight `Allow-Headers` |
+|---|---|---|---|
+| Origin `https://evil.example` | **(none)** ✅ | — | preflight approved **nothing** ✅ |
+| `chrome-extension://oijkpjikiabildophmlfeihojjpghmed` | reflected ✅ | `true` ✅ | `authorization, content-type` ✅ (the M4 derive path) |
+| `chrome-extension://clkinc…` (the earlier wrong ID) | **(none)** ✅ | — | — (the old entry is gone — the list is exactly the real ID + the two vite origins) |
+| `http://localhost:5173` / `http://127.0.0.1:5173` | reflected ✅ | `true` ✅ | `authorization, content-type` ✅ |
+| No Origin header | (none) ✅ | — | — ✅ |
+
+**Browser acceptance — COMPLETED 2026-10-26 (all checks passed, `m2smoke.js`, fresh profile per variant, Brave 156 stand-in, CDP 9333).** The run was first cancelled by the session restart (no result); after the infra came back it had to be *rebuilt from scratch* — the restart purged the whole scratch dir (harness + node_modules gone; the private key with them — §5) — and the rebuild surfaced three environment facts that shaped the final harness:
+
+1. **The context menu cannot be driven by CDP input in Brave 156** — a synthesized right-click (press+release, button:right) fires no menu: verified by screenshot (page, no menu) and accessibility tree (no menu nodes). The *physical* "Save to Bookmark" item is therefore unclickable from CDP here. The trigger is instead the content script's `CAPTURE_WEB` *handler body* executed in the extension's isolated world — the exact code `universal.js` runs when the worker's `onClicked` sends it (extraction → SAVE → worker → backend → toast), minus the menu click and the screenshot hop. (M1's harness used the same mechanism; its log's "right-click save" was the canary's intent.)
+2. **A content script's execution context reports the *extension's* origin** (`chrome-extension://oijkp…`, name "Internet Expedition"), not the page's — a context picker filtering on the page origin finds nothing (it finds only the page world + browser-extension worlds like `chrome://cosmetic_filters`). The picker matches the `chrome-extension://` origin **and functionally verifies** the world contains `bmShowError` + `extractWebPage` before trusting it. (Also learned: modern CDP removed `getExecutionContexts` — `Runtime.enable`'s immediate `executionContextCreated` burst is the only way in.)
+3. **MV3 idle reaping** — a 10 s keepalive (a no-type message, ignored by bus rule 1, zero console noise) keeps the worker and its CDP console socket alive across the waits.
+
+Actual results (both variants):
+
+| Check | DEV (`.dev-load`, against the live `:8080` backend) | SAAS (committed `extension/`) |
+|---|---|---|
+| C1 `chrome.runtime.id` | `oijkpjikiabildophmlfeihojjpghmed` ✅ | same ✅ (one key, two manifests) |
+| C2 `chrome.storage.local` | exactly `{"api_base_url":"http://localhost:8080"}` — one key, no `access_token` ✅ | exactly `{"api_base_url":"https://internetexpedition.ajiteshtamrakar.com"}` ✅ |
+| C3 toast (after save) | error panel, title "Couldn't save", **msg "Something went wrong saving this. It wasn't saved."**, actions `["Copy details"]` ✅ (the 401 branch) | error panel, **msg "Couldn't save this — check your connection and try again."**, no actions ✅ (the FETCH_ERROR branch) |
+| C4 worker console | `Received message in background` → `Detected platform: web` → `Backend error: 401` ✅ | `…` → `postJSON failed: TypeError: Failed to fetch` (at `background.js:158`) ✅ — the NXDOMAIN pinned origin; **recorded, not chased** (P3) |
+| C4c response | `{"status":"ERROR","code":401,"error":{"detail":"Authentication credentials were not provided."}}` ✅ — **the atomicity proof: the SaaS backend is reached and its auth layer rejects** | `{"status":"FETCH_ERROR","error":"Failed to fetch"}` ✅ |
+| C5 popup stub | real document — tab self-closed by the v1 launcher, which opened `http://localhost:8081/` (a chrome-error page never executes JS; the M1 race, logged) ✅ | same ✅ |
+| C6 origin guard | **note, not a pass/fail** — the guard sits in `chrome.contextMenus.onClicked`, untriggerable under CDP here (finding 1); code verified statically vs M1's handler; interactive check deferred to the M8 net | n/a (pinned origin NXDOMAIN) |
+| C7 toast auto-dismiss | 10 s dismiss ✅ | ✅ |
+| C4b worker exceptions | none ✅ | none ✅ |
+
+**Not tested / out of scope:** relay (M4), SameSite probe (M4 step 0 — explicit non-goal), any credentialed flow (no tokens exist until M4).
+
+### 7. Integration status
+
+First milestone where the extension **targets a real backend**: the worker now calls `{api_base_url}/captures/` and the local dev environment (dev manifest + `:8080` backend) exists for exactly this. The unauthenticated 401 exchange is the verified design outcome (B0's allowlist admits the ext-ID origin; the JWT layer rejects the unauthenticated call — the same branch M4's derived token will clear). Extension × frontend: not applicable (the identity surface is M3; its vite origins are already allowlisted by B0).
+
+### 8. Problems found, fixes, unresolved
+
+- **The extension ID was wrong on paper (found 2026-10-26, in the browser acceptance).** A previous session derived `clkincbmeekldgkilbeifchiigclhbch` from the committed key and put it in `CORS_ALLOWED_ORIGINS`; the derivation was buggy (the rework doc's rule is SHA-256 of the public key's **DER bytes** — the on-paper computation was not actually of the DER bytes). The *first real-browser load* shows the truth: `chrome.runtime.id` = **`oijkpjikiabildophmlfeihojjpghmed`** — with the wrong allowlist entry, the real extension would have received **no** CORS headers at all (its credentialed calls, M4 onward, would have died at the CORS layer). The earlier `DEBUG=0` curl battery "passed" but was self-fulfilling: it tested the string the settings listed, which was the wrong string. **Fix:** the allowlist entry is the browser-verified ID (a follow-up commit to B0); a comment in `settings.py` records that the real-browser check is the guard; the two root docs re-derived.
+- **`cp -R` self-recursion** when the load dir is inside `extension/` — the dev script's first build would have swallowed itself; fixed with a tar `--exclude`. Found by watching the tree grow, before it bit.
+- **Stale venv** (missing `django_q` / `supabase` against current `requirements.txt`) — installed at pinned versions; environment fix only.
+- **M1's scratch Brave** was still running on CDP 9333 from 2026-10-25 — killed before the M2 runs (a shared port would have corrupted both).
+- **The Supabase host in `.env` no longer resolves** (NXDOMAIN, like the web domain) — the suite runs against the local Docker container; `.env`'s Supabase `DB_*` values are untouched (the `DB_*` *environment* overrides win, per `read_env(overwrite=False)`). **Unresolved by design**: deploying the actual origin is P3 (parked) — the SaaS manifest's pinned domain is NXDOMAIN, so SaaS-manifest saves fail at DNS. That is exactly what the completed run observed (`FETCH_ERROR`, §6) — recorded, not chased.
+- **The browser run was killed by the session restart** (infra: backend + harness died together; the restart also purged the whole scratch dir — harness, node_modules, and the private key). The harness was rebuilt from scratch and the completed run is recorded in §6; the rebuild's findings (menu suppression, context origins, keepalive) are the durable part of this entry.
+
+### 9. Deviations from the plan
+
+1. **`detectPlatform` survives M2** (impl doc end-state inventory said "M2") — milestone-spec "v1-shaped handler" wins; M5 router collapse is the removal point. §5.
+2. **Suite ran in a Docker container** instead of the `.env` Supabase DB — the host is unreachable from this machine; owner-approved; `DB_*` overrides; no project file changed. §5.
+3. **Private key in the scratch dir** (not 1Password) — the owner's explicit call after being offered the option; risk + clipboard-copy recorded. §5.
+4. **`JWT_AUTH_SAMESITE=Strict` lives in `.env`** (gitignored) — the code default stays `Lax` with a reworded comment; the value resolves through settings' own environ path, and B0's acceptance criteria (the curl battery) are SameSite-agnostic.
+5. **The acceptance *trigger* is the `CAPTURE_WEB` handler body, not a click on the context-menu item.** Brave 156 (Chrome 156) suppresses the system context menu for CDP-synthesized input — so the physical "Save to Bookmark" item cannot be clicked from the harness. Everything *downstream* of the menu is exercised (content-script extraction → SAVE → worker → backend → toast → dismiss); the menu click itself is the one untestable hop (deferred to the M8 net / a manual run — C6). The save *flow* is fully verified; only its physical entry point is proxied.
+
+### 10. Exact next step(s)
+
+**M2 is complete** — all acceptance items have actual results in §6; the board flips to ✅. **Do not start M3 in the same breath**; it begins as a deliberate step.
+
+1. **M3 — the identity-surface frontend** (impl doc §4/§7): React + Vite, same-origin, WhiteNoise-served; OTP login (request → confirm → resend), registration, session context, fetch wrapper, the ~5-line sync-event emitter (`auth:signed-in`/`auth:signed-out`), one-line signed-in dashboard. Its M2 prerequisites (vite origins in the allowlist, B0) are in. **First action at kickoff: confirm a working local email path for the OTP code** (console backend for local dev; anymail/Resend later — Railway blocks outbound SMTP) — without it the login flow can't be tested end-to-end and M3's acceptance is blocked.
