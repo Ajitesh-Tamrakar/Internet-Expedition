@@ -20,8 +20,10 @@ media/
 ds-bundle/
 .design-sync/
 
-# Local planning docs
-planning_docs/
+# Local planning docs — the plan docs are local-only; the two progress docs are the exception (tracked on cloud-migration, impl doc §0.4)
+planning_docs/*
+!planning_docs/extension_documention.md
+!planning_docs/extension_milestone_progress.md
 
 # Extension
 extension/.dev-load/

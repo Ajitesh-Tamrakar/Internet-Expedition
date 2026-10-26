@@ -1,15 +1,15 @@
 # Extension implementation — session progress log
 
-A **record of what actually happened**, per the impl doc `planning_docs/extension_implementation.md` §0.4 (filename kept exactly as specified, spelling included). Kept at the repo root, git-tracked on `extension/rework`, updated as work progresses — never claimed a test passed if it was not run.
+A **record of what actually happened**, per the impl doc `planning_docs/extension_implementation.md` §0.4 (filename kept exactly as specified, spelling included). Kept in `planning_docs/` with the plan docs (re-homed from the repo root 2026-10-26, owner-confirmed), git-tracked on `cloud-migration` (the folder is gitignored; a `.gitignore` negation keeps this file + the board tracked), updated as work progresses — never claimed a test passed if it was not run.
 
-Milestones: M1 → M8 (impl doc §7). Status overview: `extension_milestone_progress.md`.
+Milestones: M1 → M8 (impl doc §7). Status overview: `extension_milestone_progress.md` (alongside this file in `planning_docs/`).
 
 ---
 
 ## M1 — Extension foundation: seed, vendor, strip
 
 **Session:** 2026-10-25 (two working sessions; this entry completed 2026-10-25).
-**Branch:** `extension/rework`, base `aeaeac3` (cloud-migration).
+**Branch:** `cloud-migration`, base `aeaeac3`.
 
 ### 1. Current milestone — objective
 
@@ -42,7 +42,7 @@ A loadable `extension/` at the repo root: the v1 state-C tree byte-faithful, cur
 | `icons/*` (5) | v1 as copied (untouched) |
 | `popup/popup.html` + `popup.js` | v1 as copied — **byte-identical to `origin/main`**, kept as the inert placeholder (the "Bookmark" h1 + the v1 launcher: opens `localhost:8081`, `window.close()`). Dies with the M6 popup rewrite |
 | `vendor/readability/Readability.js` (2786 ln), `Readability-readerable.js` (122 ln), `LICENSE.md`, `VENDOR.md` | step 1b — `@mozilla/readability@0.6.0` from the npm tarball, byte-as-is, version-pinned |
-| `extension_documention.md` (this file) + `extension_milestone_progress.md` (repo root) | the two required progress docs |
+| `extension_documention.md` (this file) + `extension_milestone_progress.md` — created at the repo root; re-homed to `planning_docs/` on 2026-10-26 (owner-confirmed; the `.gitignore` negation keeps both tracked) | the two required progress docs |
 
 ### 4. Important functions / modules (post-M1 state)
 
@@ -120,7 +120,7 @@ Prerequisite: only M1 (done). Nothing else is due.
 ## M2 — Extension core architecture: identity, floor, dev environment, B0 — ✅ completed 2026-10-26
 
 **Session:** 2026-10-26 (completed same day). All six tasks landed; every acceptance item — including the real-browser run — has an actual recorded result in §6.
-**Branch:** `extension/rework`; M1 set was the clean base. M2 commits: `77709d6` (identity + manifest step + `api_base_url` + dev manifest + dev script) → `57c33c7` (worker floor) → `b4ff40d` (B0) → `067770a` (B0 fix — the allowlist's extension origin was a derivation error; the browser-verified ID) → docs (this entry + board).
+**Branch:** `cloud-migration`; M1 set was the clean base (off `aeaeac3`). M2 commits: `77709d6` (identity + manifest step + `api_base_url` + dev manifest + dev script) → `57c33c7` (worker floor) → `b4ff40d` (B0) → `067770a` (B0 fix — the allowlist's extension origin was a derivation error; the browser-verified ID) → docs (this entry + board).
 
 ### 1. Current milestone — objective
 
@@ -230,3 +230,11 @@ First milestone where the extension **targets a real backend**: the worker now c
 **M2 is complete** — all acceptance items have actual results in §6; the board flips to ✅. **Do not start M3 in the same breath**; it begins as a deliberate step.
 
 1. **M3 — the identity-surface frontend** (impl doc §4/§7): React + Vite, same-origin, WhiteNoise-served; OTP login (request → confirm → resend), registration, session context, fetch wrapper, the ~5-line sync-event emitter (`auth:signed-in`/`auth:signed-out`), one-line signed-in dashboard. Its M2 prerequisites (vite origins in the allowlist, B0) are in. **First action at kickoff: confirm a working local email path for the OTP code** (console backend for local dev; anymail/Resend later — Railway blocks outbound SMTP) — without it the login flow can't be tested end-to-end and M3's acceptance is blocked.
+
+---
+
+## Docs session — progress docs re-homed to `planning_docs/` + branch correction (2026-10-26)
+
+**Owner decision (2026-10-26):** the two progress docs (this file + `extension_milestone_progress.md`) move from the repo root to `planning_docs/` (alongside the impl + rework plan docs) and remain **git-tracked on `cloud-migration`** — the folder stays gitignored for the local-only plan docs, with a `.gitignore` negation for the two progress docs. Also: **there is no `extension/rework` branch in this checkout** — every commit (M1 + M2) landed directly on `cloud-migration`; the `extension/rework` branch names recorded in the M1/M2 entries above were wrong and are corrected in place. The impl doc's §0.4, §2 tree, §6-21(g), §7 common-to-every-milestone, and M1 sections are amended to match, and the board's branch/flag lines updated. Docs-only session — no code touched, nothing tested that was not previously tested.
+
+**Files changed:** `planning_docs/extension_documention.md` + `planning_docs/extension_milestone_progress.md` (re-homed, `git mv` — tracked status preserved); `.gitignore` (folder-ignore → contents-ignore + two negations); `planning_docs/extension_implementation.md` (local-only — not tracked).
