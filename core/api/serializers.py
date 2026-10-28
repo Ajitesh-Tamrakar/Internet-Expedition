@@ -158,7 +158,17 @@ class CaptureSerializer(serializers.ModelSerializer):
                     )
                     media_storage.save_bytes(name, file.read())
                     sources.append(
-                        {"id": source_id, "url": name, "original_url": url or None}
+                        {
+                            "id": source_id,
+                            "url": name,
+                            "original_url": url or None,
+                            # The client handed over the bytes: stored,
+                            # assessed, done — the worker's ingest skips
+                            # it (the status completes the
+                            # downloaded/skipped/download_failed
+                            # convention on stored items).
+                            "status": "downloaded",
+                        }
                     )
                 else:
                     # Link-only item: as before. No original_url yet —

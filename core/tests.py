@@ -42,6 +42,7 @@ from core.models import (
     ProviderRateSlot,
 )
 from core.pipeline import (
+    NoUsableContentError,
     build_unified_text,
     enqueue_capture_processing,
     extract_contexts,
@@ -51,11 +52,11 @@ from core.pipeline import (
 from core.search import PREVIEW_CHARS, search_captures
 from core.storage import (
     SupabaseStorage,
-    MediaIngestError,
     extension_for,
     fetchable_reference,
     ingest_capture_media,
     is_external_url,
+    media_failure_summary,
     media_object_path,
     resolve_source,
     screenshot_upload_to,
@@ -572,6 +573,75 @@ class CaptureContextApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         context.refresh_from_db()
         self.assertIsNone(context.summary_text)
+
+    @patch("core.storage.get_storage")
+    @patch("core.storage.requests.get")
+    @patch("core.pipeline.GeminiProvider")
+    def test_post_all_failed_media_is_409(self, mock_provider_cls, fake_get, storage):
+        # Every item dies at both stages: the endpoint must answer with a
+        # clean 409 and the failure summary, not a 500 — and must not
+        # leave a zombie context row behind.
+        import shutil as _shutil
+
+        tmp = tempfile.mkdtemp(prefix="bm-media-")
+        self.addCleanup(_shutil.rmtree, tmp, True)
+        storage.return_value = _local_storage(tmp)
+        fake_get.side_effect = lambda url, **kw: _fake_get_response(status_code=403)
+        mock_provider_cls.return_value = MediaFakeProvider(
+            fail_on={"https://origin.example/a.jpg"}
+        )
+        capture = Capture.objects.create(
+            user=self.user_a,
+            image_sources=[{"id": "i1", "url": "https://origin.example/a.jpg"}],
+        )
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(f"/capture-context/{capture.capture_id}/")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("a.jpg", response.data["detail"])
+        self.assertFalse(
+            CaptureContext.objects.filter(capture_id=capture).exists()
+        )
+
+    @patch("core.storage.get_storage")
+    @patch("core.storage.requests.get")
+    @patch("core.pipeline.GeminiProvider")
+    def test_post_degraded_media_saves_with_marker(
+        self, mock_provider_cls, fake_get, storage
+    ):
+        # One dead image, but text survives: the context is saved (201)
+        # with the failed item represented as an empty marker.
+        import shutil as _shutil
+
+        tmp = tempfile.mkdtemp(prefix="bm-media-")
+        self.addCleanup(_shutil.rmtree, tmp, True)
+        storage.return_value = _local_storage(tmp)
+
+        def fake_get_side_effect(url, **kw):
+            if url.endswith("b.png"):
+                return _fake_get_response(status_code=404)
+            return _fake_get_response(b"img")
+
+        fake_get.side_effect = fake_get_side_effect
+        mock_provider_cls.return_value = MediaFakeProvider(
+            fail_on={"https://origin.example/b.png"}
+        )
+        capture = Capture.objects.create(
+            user=self.user_a,
+            text_sources=["an article about red trucks"],
+            image_sources=[
+                {"id": "i1", "url": "https://origin.example/a.jpg"},
+                {"id": "i2", "url": "https://origin.example/b.png"},
+            ],
+        )
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(f"/capture-context/{capture.capture_id}/")
+
+        self.assertEqual(response.status_code, 201)
+        by_id = {item["id"]: item for item in response.data["image_context"]}
+        self.assertNotIn("status", by_id["i1"])
+        self.assertEqual(by_id["i2"]["status"], "download_failed")
+        self.assertEqual(by_id["i2"]["context"], "")
 
 
 def _stale_delta():
@@ -2002,28 +2072,86 @@ class MediaIngestTests(TestCase):
         self.assertEqual(entry["original_url"], "https://origin.example/a.jpg")
         self.assertFalse(os.path.exists(os.path.join(self.tmp, entry["url"])))
 
-    def test_download_failures_are_collected_and_raised(self):
+    def test_download_failures_mark_the_entries_and_do_not_raise(self):
         self.fake_get.side_effect = lambda url, **kw: _fake_get_response(
             status_code=403
         )
         capture = self._capture()
 
-        with self.assertRaises(MediaIngestError) as ctx:
-            ingest_capture_media(capture)
+        result = ingest_capture_media(capture)  # must not raise
 
-        message = str(ctx.exception)
-        self.assertIn("https://origin.example/a.jpg", message)
-        self.assertIn("https://origin.example/big.mp4", message)
-        self.assertIn("HTTP 403", message)
-
+        self.assertIs(result, capture)
         capture.refresh_from_db()
-        # Nothing was changed in the DB: a retry re-attempts both sources.
+        for entry in capture.image_sources + capture.video_sources:
+            self.assertEqual(entry["status"], "download_failed")
+            self.assertEqual(entry["download_error"], "HTTP 403")
+            # Still external, and NOT assessed: a retry re-attempts it.
+            self.assertTrue(entry["url"].startswith("https://"))
+            self.assertNotIn("original_url", entry)
         self.assertEqual(
-            capture.image_sources[0]["url"], "https://origin.example/a.jpg"
+            media_failure_summary(capture),
+            "media: 2 item(s) failed: "
+            "https://origin.example/a.jpg (HTTP 403); "
+            "https://origin.example/big.mp4 (HTTP 403)",
         )
-        self.assertNotIn("original_url", capture.image_sources[0])
 
-    def test_mixed_outcomes_save_successes_then_raise(self):
+    def test_failed_item_is_reattempted_on_a_later_run(self):
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(
+            status_code=403
+        )
+        capture = self._capture()
+
+        ingest_capture_media(capture)
+        self.fake_get.reset_mock()
+        ingest_capture_media(capture)  # a dead link may come back: re-attempt
+
+        self.assertEqual(self.fake_get.call_count, 2)
+
+    def test_failed_item_recovers_when_the_link_comes_back(self):
+        calls = {"n": 0}
+
+        def fake_get(url, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _fake_get_response(status_code=404)
+            return _fake_get_response(b"img")
+
+        self.fake_get.side_effect = fake_get
+        capture = Capture.objects.create(
+            user=self.user,
+            image_sources=[{"id": "i1", "url": "https://origin.example/a.jpg"}],
+        )
+
+        ingest_capture_media(capture)
+        capture.refresh_from_db()
+        self.assertEqual(capture.image_sources[0]["status"], "download_failed")
+
+        ingest_capture_media(capture)
+        capture.refresh_from_db()
+        entry = capture.image_sources[0]
+        self.assertEqual(entry["status"], "downloaded")
+        # The object name is built from the entry's id + the URL's extension.
+        self.assertEqual(entry["url"], f"{capture.capture_id}/images/i1.jpg")
+        self.assertEqual(entry["original_url"], "https://origin.example/a.jpg")
+
+    def test_storage_upload_failure_degrades_per_item(self):
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(b"img")
+        with patch(
+            "core.storage.save_bytes", side_effect=OSError("disk full")
+        ):
+            capture = self._capture()
+
+            result = ingest_capture_media(capture)  # must not raise
+
+        self.assertIs(result, capture)
+        capture.refresh_from_db()
+        for entry in capture.image_sources + capture.video_sources:
+            self.assertEqual(entry["status"], "download_failed")
+            self.assertEqual(entry["download_error"], "storage upload failed: OSError")
+            self.assertTrue(entry["url"].startswith("https://"))
+            self.assertNotIn("original_url", entry)
+
+    def test_mixed_outcomes_keep_successes_and_mark_failures(self):
         def fake_get(url, **kw):
             if url.endswith(".jpg"):
                 return _fake_get_response(b"img")
@@ -2032,17 +2160,21 @@ class MediaIngestTests(TestCase):
         self.fake_get.side_effect = fake_get
         capture = self._capture()
 
-        with self.assertRaises(MediaIngestError):
-            ingest_capture_media(capture)
+        ingest_capture_media(capture)  # must not raise
 
         capture.refresh_from_db()
-        # The successful download was stored ...
-        self.assertTrue(
-            capture.image_sources[0]["url"].startswith(str(capture.capture_id))
-        )
-        # ... while the failure stays external for the retry.
+        img, vid = capture.image_sources[0], capture.video_sources[0]
+        # The successful download was stored (name from the entry's id) ...
+        self.assertEqual(img["status"], "downloaded")
+        self.assertEqual(img["url"], f"{capture.capture_id}/images/i1.jpg")
+        self.assertEqual(img["original_url"], "https://origin.example/a.jpg")
+        # ... while the failure stays external for the retry, marked.
+        self.assertEqual(vid["status"], "download_failed")
+        self.assertEqual(vid["url"], "https://origin.example/big.mp4")
+        self.assertNotIn("original_url", vid)
         self.assertEqual(
-            capture.video_sources[0]["url"], "https://origin.example/big.mp4"
+            media_failure_summary(capture),
+            "media: 1 item(s) failed: https://origin.example/big.mp4 (HTTP 404)",
         )
 
     def test_noop_when_nothing_external(self):
@@ -2059,6 +2191,76 @@ class MediaIngestTests(TestCase):
         self.fake_get.assert_not_called()
         # No save at all: updated_at untouched.
         self.assertEqual(Capture.objects.get(pk=capture.pk).updated_at, updated_before)
+
+    def _assessed_entry(self, url, status, **extra):
+        entry = {"id": "i1", "url": url, "original_url": "assessed", "status": status}
+        entry.update(extra)
+        return entry
+
+    def test_failure_summary_is_none_when_all_is_well(self):
+        capture = self._capture()
+        capture.image_sources[0] = self._assessed_entry(
+            f"{capture.capture_id}/images/i1.jpg", "downloaded"
+        )
+        capture.video_sources[0] = self._assessed_entry(
+            "https://origin.example/big.mp4", "skipped"
+        )
+        self.assertIsNone(media_failure_summary(capture))
+
+    def test_failure_summary_names_download_and_processing_failures(self):
+        capture = self._capture()
+        # A stored item whose provider call failed (processing_error) ...
+        capture.image_sources[0] = self._assessed_entry(
+            f"{capture.capture_id}/images/i1.jpg",
+            "downloaded",
+            original_url="https://origin.example/a.jpg",
+            processing_error="ClientError",
+        )
+        # ... and a link that could not be downloaded at all.
+        capture.video_sources[0] = {
+            "id": "v1",
+            "url": "https://origin.example/big.mp4",
+            "status": "download_failed",
+            "download_error": "HTTP 404",
+        }
+        self.assertEqual(
+            media_failure_summary(capture),
+            "media: 2 item(s) failed: "
+            "https://origin.example/a.jpg (processing failed: ClientError); "
+            "https://origin.example/big.mp4 (HTTP 404)",
+        )
+
+    def test_failure_summary_never_leaks_internal_storage_paths(self):
+        capture = self._capture()
+        # A stored item with no client-reported URL (a multipart upload):
+        # the label must fall back to the id, not the bucket path.
+        capture.image_sources[0] = self._assessed_entry(
+            f"{capture.capture_id}/images/i1.jpg",
+            "downloaded",
+            original_url=None,
+            processing_error="ClientError",
+        )
+        note = media_failure_summary(capture)
+        self.assertIsNotNone(note)
+        self.assertIn("i1 (processing failed: ClientError)", note)
+        self.assertNotIn(str(capture.capture_id), note)
+
+    def test_failure_summary_truncates_long_failure_lists(self):
+        capture = self._capture()
+        capture.image_sources = [
+            {
+                "id": f"i{n}",
+                "url": f"https://origin.example/x{n}.jpg",
+                "status": "download_failed",
+                "download_error": "HTTP 404",
+            }
+            for n in range(7)
+        ]
+        note = media_failure_summary(capture)
+        self.assertIn("media: 7 item(s) failed:", note)
+        self.assertIn("(+2 more)", note)
+        self.assertNotIn("x6.", note)  # beyond the first five
+        self.assertLessEqual(len(note), 500)
 
 
 @override_settings(**SUPABASE_ENV)
@@ -2094,6 +2296,31 @@ class MediaIngestSupabaseModeTests(TestCase):
         self.assertEqual(self.fake_client.api.objects[name][0], b"img")
         capture.refresh_from_db()
         self.assertEqual(capture.image_sources[0]["url"], name)
+        self.assertEqual(capture.image_sources[0]["status"], "downloaded")
+
+    def test_bucket_upload_failure_degrades_per_item(self):
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(b"img")
+
+        def fail_upload(path, file, file_options=None):
+            raise RuntimeError("bucket is down")
+
+        self.fake_client.api.upload = fail_upload
+        capture = Capture.objects.create(
+            user=self.user,
+            image_sources=[{"id": "i1", "url": "https://origin.example/a.jpg"}],
+        )
+
+        ingest_capture_media(capture)  # must not raise
+
+        capture.refresh_from_db()
+        entry = capture.image_sources[0]
+        self.assertEqual(entry["status"], "download_failed")
+        self.assertEqual(
+            entry["download_error"], "storage upload failed: RuntimeError"
+        )
+        # Still external, not assessed: a later run re-attempts it.
+        self.assertEqual(entry["url"], "https://origin.example/a.jpg")
+        self.assertNotIn("original_url", entry)
 
 
 class CaptureMediaApiTests(APITestCase):
@@ -2397,24 +2624,43 @@ class CaptureMediaApiTests(APITestCase):
 
 class MediaFakeProvider(FakeProvider):
     """FakeProvider plus the media description calls the context phase
-    runs, recording the exact reference each call received."""
+    runs, recording the exact reference each call received.
 
-    def __init__(self, **kwargs):
+    ``fail_on`` lists source URLs (the entry's ``url``) whose provider
+    call should raise — the stand-in for a file Gemini cannot read, or
+    a link whose origin is gone for good.
+    """
+
+    def __init__(self, fail_on=(), **kwargs):
         super().__init__(**kwargs)
         self.image_calls: list = []
         self.video_calls: list = []
         self.audio_calls: list = []
+        self.fail_on = {self._as_url(u) for u in fail_on}
+
+    @staticmethod
+    def _as_url(source):
+        return source.get("url") if isinstance(source, dict) else source
+
+    def _maybe_fail(self, source):
+        if self._as_url(source) in self.fail_on:
+            raise RuntimeError(
+                f"simulated media failure for {self._as_url(source)}"
+            )
 
     def describe_image(self, source):
         self.image_calls.append(source)
+        self._maybe_fail(source)
         return f"image of {source}"
 
     def describe_video(self, source):
         self.video_calls.append(source)
+        self._maybe_fail(source)
         return f"video of {source}"
 
     def transcribe_audio(self, source):
         self.audio_calls.append(source)
+        self._maybe_fail(source)
         return f"audio of {source}"
 
 
@@ -2464,7 +2710,11 @@ class PipelineMediaPhaseTests(TestCase):
         )
         self.assertTrue(os.path.exists(os.path.join(self.tmp, entry["url"])))
 
-    def test_ingest_failure_marks_failed_and_lists_all_causes(self):
+    def test_all_failed_media_fails_the_capture_with_a_summary(self):
+        # A media-only capture whose items die at BOTH stages (the app
+        # cannot download them and the origin is gone for the provider
+        # too): nothing usable remains, so the run fails — with the
+        # failure summary naming every item, not a stack trace.
         capture = Capture.objects.create(
             user=self.user,
             image_sources=[
@@ -2475,19 +2725,99 @@ class PipelineMediaPhaseTests(TestCase):
         self.fake_get.side_effect = lambda url, **kw: _fake_get_response(
             status_code=403
         )
-        self.provider_cls.return_value = MediaFakeProvider()
+        self.provider_cls.return_value = MediaFakeProvider(
+            fail_on={"https://origin.example/a.jpg", "https://origin.example/b.png"}
+        )
 
-        with self.assertRaises(MediaIngestError):
+        with self.assertRaises(NoUsableContentError):
             process_capture(str(capture.capture_id))
 
         capture.refresh_from_db()
         self.assertEqual(capture.status, Capture.Status.FAILED)
-        self.assertIn("MediaIngestError", capture.error_note)
+        self.assertIn("media: 2 item(s) failed", capture.error_note)
         self.assertIn("a.jpg", capture.error_note)
         self.assertIn("b.png", capture.error_note)
         self.assertFalse(
             CaptureContext.objects.filter(capture_id=capture).exists()
         )
+
+    def test_one_dead_media_degrades_the_capture_to_ready(self):
+        # One of two images is dead at both stages; the other (plus the
+        # text) survives. The capture completes `ready` with a note that
+        # names only the lost item — it does not fail.
+        capture = Capture.objects.create(
+            user=self.user,
+            text_sources=["an article about red trucks"],
+            image_sources=[
+                {"id": "i1", "url": "https://origin.example/a.jpg"},
+                {"id": "i2", "url": "https://origin.example/b.png"},
+            ],
+        )
+
+        def fake_get(url, **kw):
+            if url.endswith("b.png"):
+                return _fake_get_response(status_code=404)
+            return _fake_get_response(b"img")
+
+        self.fake_get.side_effect = fake_get
+        self.provider_cls.return_value = MediaFakeProvider(
+            fail_on={"https://origin.example/b.png"}
+        )
+
+        process_capture(str(capture.capture_id))  # must not raise
+
+        capture.refresh_from_db()
+        self.assertEqual(capture.status, Capture.Status.READY)
+        self.assertIsNotNone(capture.error_note)
+        self.assertIn("b.png", capture.error_note)
+        self.assertNotIn("a.jpg", capture.error_note)
+        self.assertNotIn("trucks", capture.error_note)
+
+        context = CaptureContext.objects.get(capture_id=capture)
+        by_id = {item["id"]: item for item in context.image_context}
+        # The survivor was described from the stored copy ...
+        self.assertTrue(
+            by_id["i1"]["context"].startswith("image of")
+        )
+        self.assertNotIn("status", by_id["i1"])
+        # ... the dead one is a failure marker with an empty context.
+        self.assertEqual(by_id["i2"]["status"], "download_failed")
+        self.assertEqual(by_id["i2"]["context"], "")
+        # The summary describes what is left ...
+        self.assertEqual(context.summary_text, "A unified summary.")
+        self.assertNotIn("b.png", context.summary_text or "")
+        # ... and embeddings were built for the surviving content.
+        self.assertTrue(
+            CaptureEmbedding.objects.filter(capture_id=capture).exists()
+        )
+
+    def test_dead_download_but_reachable_origin_still_describes(self):
+        # The app's own download 403s, but the provider's origin fetch
+        # (its documented fallback for link-based sources) succeeds: the
+        # item degrades for storage, yet its content is captured and the
+        # note names the storage-side failure only.
+        capture = Capture.objects.create(
+            user=self.user,
+            text_sources=["an article about red trucks"],
+            image_sources=[{"id": "i1", "url": "https://origin.example/a.jpg"}],
+        )
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(
+            status_code=403
+        )
+        self.provider_cls.return_value = MediaFakeProvider()
+
+        process_capture(str(capture.capture_id))
+
+        capture.refresh_from_db()
+        self.assertEqual(capture.status, Capture.Status.READY)
+        self.assertIsNotNone(capture.error_note)
+        self.assertIn("a.jpg", capture.error_note)
+        entry = capture.image_sources[0]
+        self.assertEqual(entry["status"], "download_failed")
+        self.assertNotIn("processing_error", entry)  # the attempt succeeded
+        context = CaptureContext.objects.get(capture_id=capture)
+        self.assertEqual(len(context.image_context), 1)
+        self.assertTrue(context.image_context[0]["context"].startswith("image of"))
 
     def test_stale_processing_media_is_reclaimed_and_finished(self):
         capture = self._media_capture()
@@ -2518,6 +2848,181 @@ class PipelineMediaPhaseTests(TestCase):
         )
         capture.refresh_from_db()
         self.assertEqual(capture.status, Capture.Status.PROCESSING_MEDIA)
+
+
+class ContextPhaseDegradationTests(TestCase):
+    """extract_contexts: failed media items degrade per item."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "u", "u@example.com", "pw"
+        )
+        self.tmp = tempfile.mkdtemp(prefix="bm-media-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        storage_patcher = patch(
+            "core.storage.get_storage", return_value=_local_storage(self.tmp)
+        )
+        get_patcher = patch("core.storage.requests.get")
+        for patcher in (storage_patcher, get_patcher):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.fake_get = get_patcher.start()
+
+    def test_download_failed_item_yields_a_marker_item(self):
+        # An item a previous run already failed to download (external
+        # URL, not assessed); this run's download fails again and the
+        # provider's origin attempt dies too. Text keeps the capture
+        # alive.
+        capture = Capture.objects.create(
+            user=self.user,
+            text_sources=["an article about red trucks"],
+            image_sources=[
+                {
+                    "id": "i1",
+                    "url": "https://origin.example/a.jpg",
+                    "status": "download_failed",
+                    "download_error": "HTTP 404",
+                }
+            ],
+        )
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(
+            status_code=404
+        )
+        provider = MediaFakeProvider(fail_on={"https://origin.example/a.jpg"})
+
+        text, image, video, audio, summary = extract_contexts(capture, provider)
+
+        self.assertEqual(text, "summarized: an article about red trucks")
+        self.assertEqual(
+            image,
+            [{"id": "i1", "context": "", "status": "download_failed"}],
+        )
+        self.assertEqual(summary, "A unified summary.")
+        # The failure reason was persisted on the source entry ...
+        capture.refresh_from_db()
+        self.assertEqual(
+            capture.image_sources[0]["processing_error"], "RuntimeError"
+        )
+        # ... and the summary of failures is available for error_note.
+        self.assertIn("a.jpg", media_failure_summary(capture))
+
+    def test_stale_processing_error_is_cleared_on_success(self):
+        # A stored item a previous run failed to PROCESS. The retry
+        # succeeds: the reason must not linger (or a later error_note
+        # would name a healthy item).
+        capture = Capture.objects.create(
+            user=self.user,
+            text_sources=["an article about red trucks"],
+        )
+        name = f"{capture.capture_id}/images/i1.jpg"
+        os.makedirs(os.path.join(self.tmp, os.path.dirname(name)), exist_ok=True)
+        with open(os.path.join(self.tmp, name), "wb") as fh:
+            fh.write(b"img-bytes")
+        capture.image_sources = [
+            {
+                "id": "i1",
+                "url": name,
+                "original_url": "https://origin.example/a.jpg",
+                "status": "downloaded",
+                "processing_error": "ClientError",
+            }
+        ]
+        capture.save()
+        provider = MediaFakeProvider()
+
+        text, image, *_ = extract_contexts(capture, provider)
+
+        self.assertNotIn("status", image[0])
+        self.assertTrue(image[0]["context"].startswith("image of"))
+        capture.refresh_from_db()
+        self.assertNotIn("processing_error", capture.image_sources[0])
+        self.assertIsNone(media_failure_summary(capture))
+
+    def test_skipped_oversized_item_still_processes_via_origin(self):
+        # Kept link-based (over the size cap): the provider fetches from
+        # the origin and the item is a normal survivor, no failure marks.
+        capture = Capture.objects.create(
+            user=self.user,
+            text_sources=["an article about red trucks"],
+            image_sources=[
+                {
+                    "id": "i1",
+                    "url": "https://origin.example/big.jpg",
+                    "original_url": "https://origin.example/big.jpg",
+                    "status": "skipped",
+                }
+            ],
+        )
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(b"img")
+        provider = MediaFakeProvider()
+
+        text, image, *_ = extract_contexts(capture, provider)
+
+        self.assertNotIn("status", image[0])
+        self.assertTrue(image[0]["context"].startswith("image of"))
+        self.assertIsNone(media_failure_summary(capture))
+
+    def test_all_failed_media_only_raises_no_usable_content(self):
+        capture = Capture.objects.create(
+            user=self.user,
+            image_sources=[
+                {
+                    "id": "i1",
+                    "url": "https://origin.example/a.jpg",
+                    "status": "download_failed",
+                    "download_error": "HTTP 404",
+                },
+                {
+                    "id": "i2",
+                    "url": "https://origin.example/b.png",
+                    "status": "download_failed",
+                    "download_error": "HTTP 404",
+                },
+            ],
+        )
+        self.fake_get.side_effect = lambda url, **kw: _fake_get_response(
+            status_code=404
+        )
+        provider = MediaFakeProvider(
+            fail_on={"https://origin.example/a.jpg", "https://origin.example/b.png"}
+        )
+
+        with self.assertRaises(NoUsableContentError):
+            extract_contexts(capture, provider)
+
+    def test_undegraded_empty_capture_still_returns(self):
+        # No sources declared at all: nothing "failed", so the historical
+        # behavior stands — empty contexts, no raise (the manual endpoint
+        # keeps returning 201 with an empty row).
+        capture = Capture.objects.create(user=self.user)
+        provider = MediaFakeProvider()
+
+        text, image, video, audio, summary = extract_contexts(capture, provider)
+
+        self.assertEqual((text, image, video, audio, summary), ("", [], [], [], ""))
+
+    def test_screenshot_provider_failure_yields_a_marker(self):
+        capture = Capture.objects.create(
+            user=self.user,
+            text_sources=["an article about red trucks"],
+        )
+        name = f"{capture.capture_id}/screenshot.png"
+        os.makedirs(os.path.join(self.tmp, os.path.dirname(name)), exist_ok=True)
+        with open(os.path.join(self.tmp, name), "wb") as fh:
+            fh.write(b"png-bytes")
+        Capture.objects.filter(pk=capture.pk).update(screenshot=name)
+        capture.refresh_from_db()
+        provider = MediaFakeProvider(
+            fail_on={os.path.join(self.tmp, name)}
+        )
+
+        text, image, *_ = extract_contexts(capture, provider)
+
+        self.assertEqual(text, "summarized: an article about red trucks")
+        self.assertEqual(
+            image,
+            [{"id": str(capture.capture_id), "context": "", "status": "failed"}],
+        )
 
 
 class ScreenshotResolutionTests(TestCase):

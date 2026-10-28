@@ -51,7 +51,10 @@ class Capture(models.Model):
     # Where the background pipeline is with this capture (see Status).
     # Clients poll this; the recovery sweep trusts it.
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.PENDING)
-    # One-line description of why a `failed` capture failed.
+    # One-line description of why a `failed` capture failed — or, on a
+    # `ready` capture that degraded, which media items could not be
+    # downloaded/processed (core.storage.media_failure_summary; media
+    # failures degrade per item instead of failing the capture).
     error_note = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

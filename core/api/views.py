@@ -276,13 +276,21 @@ class MultiModelContextExtraction(ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        (
-            text_context,
-            image_context,
-            video_context,
-            audio_context,
-            summary_text,
-        ) = self._extract_contexts(capture)
+        try:
+            (
+                text_context,
+                image_context,
+                video_context,
+                audio_context,
+                summary_text,
+            ) = self._extract_contexts(capture)
+        except pipeline.NoUsableContentError as err:
+            # Every source of this capture failed to download/process:
+            # there is no context to create. A 409 with the summary,
+            # not a 500 — this is a state of the capture, not a bug.
+            return Response(
+                {"detail": str(err)}, status=status.HTTP_409_CONFLICT
+            )
 
         # -------------------------
         # SAVE
@@ -325,13 +333,21 @@ class MultiModelContextExtraction(ModelViewSet):
         # All context fields are read-only, so the client cannot supply
         # values — PATCH means "reprocess this Capture and refresh the
         # stored context".
-        (
-            text_context,
-            image_context,
-            video_context,
-            audio_context,
-            summary_text,
-        ) = self._extract_contexts(context.capture_id)
+        try:
+            (
+                text_context,
+                image_context,
+                video_context,
+                audio_context,
+                summary_text,
+            ) = self._extract_contexts(context.capture_id)
+        except pipeline.NoUsableContentError as err:
+            # Same contract as create(): nothing left to process is a
+            # 409 with the summary, and the stored context is left
+            # untouched (the reprocess never reached the refresh).
+            return Response(
+                {"detail": str(err)}, status=status.HTTP_409_CONFLICT
+            )
 
         context.text_context = text_context
         context.image_context = image_context

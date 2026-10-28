@@ -24,10 +24,18 @@ Two backends, one interface:
 The `*_sources` JSON entries on Capture follow one convention: `url` is
 a *fetchable reference* — either a bucket object path (the item is
 stored in our storage) or the original external URL (it is not; e.g. it
-was too large for the free plan). `original_url` always records the
-source URL the client reported, for provenance. This module is the only
-place that knows how to tell the two apart and how to resolve a path
-into something downloadable.
+was too large for the free plan). `original_url` records the source URL
+the client reported, for provenance; its *presence* marks "ingest has
+assessed this". An assessed item also carries a `status`:
+`downloaded` (in our storage), `skipped` (kept link-based — over the
+size cap), or `download_failed` (could not be stored; `download_error`
+records the short reason). A `download_failed` item deliberately leaves
+`original_url` unset so a later run re-attempts it — a dead link may
+come back — and it degrades the capture rather than failing it (the
+failure is summarized for `Capture.error_note` by
+:func:`media_failure_summary`). This module is the only place that knows
+how to tell the two reference kinds apart, how to resolve a path into
+something downloadable, and what a failed item means.
 
 Everything here is plain functions (no DRF/request objects) — the same
 convention as core/embedding_builder — so the same code runs from the
@@ -283,21 +291,6 @@ class MediaDownloadError(RuntimeError):
         super().__init__(f"{url} ({reason})")
 
 
-class MediaIngestError(RuntimeError):
-    """One or more media sources failed to download (all causes listed).
-
-    The message is shaped for ``Capture.error_note`` (500-char cap):
-    up to five causes, the rest counted.
-    """
-
-    def __init__(self, failures: list[tuple[str, str]]):
-        self.failures = failures
-        detail = "; ".join(f"{url} ({reason})" for url, reason in failures[:5])
-        if len(failures) > 5:
-            detail += f" (+{len(failures) - 5} more)"
-        super().__init__(f"media ingest failed: {detail}")
-
-
 _DOWNLOAD_HEADERS = {"User-Agent": "Mozilla/5.0 (bookmark)"}
 
 
@@ -350,22 +343,25 @@ def ingest_capture_media(capture, storage: Storage | None = None):
     re-downloads stored media, which is what makes retries and the
     worker's claim-guard safe.
 
-    Outcomes per source:
-      * downloaded and stored -> ``url`` rewritten to the bucket path,
-        ``original_url`` records the source;
-      * larger than ``MEDIA_MAX_FILE_BYTES`` -> ``original_url`` set but
-        ``url`` kept external (the free storage plan cannot hold it; it
-        stays link-based, exactly as before this module existed);
-      * download/storage failure -> collected; after ALL sources are
-        assessed, the successful rewrites are saved and the failures
-        are raised together as :class:`MediaIngestError` (a retry
-        re-downloads only what actually failed).
+    Outcomes per source (one item never fails the whole run — a
+    dead link degrades the capture, it does not fail it):
+      * downloaded and stored -> ``status: "downloaded"``, ``url``
+        rewritten to the bucket path, ``original_url`` records the source;
+      * larger than ``MEDIA_MAX_FILE_BYTES`` -> ``status: "skipped"``,
+        ``original_url`` set but ``url`` kept external (the free storage
+        plan cannot hold it; the provider falls back to fetching from the
+        origin);
+      * download or storage failure -> ``status: "download_failed"`` with
+        a short ``download_error`` reason; ``url`` stays external and
+        ``original_url`` stays unset on purpose, so a later run re-attempts
+        the item (a transient blip recovers; a dead link stays failed).
+        The failure is summarized for the client via
+        :func:`media_failure_summary`, never raised.
     """
     max_bytes = getattr(settings, "MEDIA_MAX_FILE_BYTES", 50 * 1024 * 1024)
     storage = storage or get_storage()
 
     changed = False
-    failures: list[tuple[str, str]] = []
 
     for field_name, kind in _SOURCE_FIELDS:
         entries = getattr(capture, field_name) or []
@@ -387,14 +383,49 @@ def ingest_capture_media(capture, storage: Storage | None = None):
             new_entry = dict(entry)
             if not new_entry.get("id"):
                 new_entry["id"] = str(uuid.uuid4())
-            new_entry["original_url"] = url
 
+            data, oversized, content_type = None, False, ""
+            error = None
             try:
                 data, oversized, content_type = download_capped(url, max_bytes)
             except MediaDownloadError as err:
-                failures.append((url, err.reason))
-                new_entries.append(entry)  # unchanged: a retry re-attempts it
+                error = err.reason
+
+            name = None
+            if error is None and not oversized:
+                name = media_object_path(
+                    str(capture.capture_id),
+                    kind,
+                    str(new_entry["id"]),
+                    extension_for(url, content_type),
+                )
+                try:
+                    save_bytes(name, data, storage=storage)
+                except Exception as err:
+                    error = f"storage upload failed: {type(err).__name__}"
+                    name = None
+
+            if error is not None:
+                # Degrade per item: mark it, keep the external URL, and let
+                # the capture continue. original_url stays UNSET — the item
+                # is not "assessed" — so a later run re-attempts it.
+                new_entry["status"] = "download_failed"
+                new_entry["download_error"] = error
+                logger.warning(
+                    "capture %s: %s could not be stored (%s: %s); the item "
+                    "degrades, the capture continues",
+                    capture.capture_id,
+                    url,
+                    kind,
+                    error,
+                )
+                new_entries.append(new_entry)
+                changed = True
                 continue
+
+            # Assessed from here on: original_url records the provenance and
+            # keeps a re-run from re-downloading.
+            new_entry["original_url"] = url
 
             if oversized:
                 logger.info(
@@ -403,25 +434,12 @@ def ingest_capture_media(capture, storage: Storage | None = None):
                     url,
                     max_bytes,
                 )
+                new_entry["status"] = "skipped"
                 new_entries.append(new_entry)
                 changed = True
                 continue
 
-            name = media_object_path(
-                str(capture.capture_id),
-                kind,
-                str(new_entry["id"]),
-                extension_for(url, content_type),
-            )
-            try:
-                save_bytes(name, data, storage=storage)
-            except Exception as err:
-                failures.append(
-                    (url, f"storage upload failed: {type(err).__name__}")
-                )
-                new_entries.append(entry)
-                continue
-
+            new_entry["status"] = "downloaded"
             new_entry["url"] = name
             new_entries.append(new_entry)
             changed = True
@@ -433,10 +451,52 @@ def ingest_capture_media(capture, storage: Storage | None = None):
     if changed:
         capture.save()
 
-    if failures:
-        raise MediaIngestError(failures)
-
     return capture
+
+
+def media_failure_summary(capture) -> str | None:
+    """A one-line summary of the media items that failed, shaped for
+    ``Capture.error_note``.
+
+    Walks the ``*_sources`` entries for the failure markers — a
+    ``download_failed`` status from ingest, or a ``processing_error``
+    left by the context phase — and names up to five of them with their
+    short reason, the rest counted. The per-item detail lives in the
+    entries themselves (the ``*_sources`` JSON is never serialized to
+    clients); this line is the client-visible part, and the labels use
+    the client-reported URLs, never internal storage paths.
+
+    Returns None when nothing failed.
+    """
+    failures = []
+    for field_name, _kind in _SOURCE_FIELDS:
+        for entry in getattr(capture, field_name) or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") == "download_failed":
+                reason = entry.get("download_error") or "download failed"
+            elif entry.get("processing_error"):
+                reason = f"processing failed: {entry['processing_error']}"
+            else:
+                continue
+            url = entry.get("url") or ""
+            if is_external_url(url):
+                label = url
+            else:
+                original = entry.get("original_url") or ""
+                label = (
+                    original
+                    if is_external_url(original)
+                    else entry.get("id") or "media"
+                )
+            failures.append(f"{label} ({reason})")
+
+    if not failures:
+        return None
+    detail = "; ".join(failures[:5])
+    if len(failures) > 5:
+        detail += f" (+{len(failures) - 5} more)"
+    return f"media: {len(failures)} item(s) failed: {detail}"
 
 
 def resolve_source(source, storage: Storage | None = None):
