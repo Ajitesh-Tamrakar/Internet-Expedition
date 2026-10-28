@@ -28,6 +28,7 @@ from rest_framework.test import APITestCase
 
 from core import otp, storage as media_storage
 from core.api import auth_views
+from core.api.serializers import CaptureSerializer
 from core.api.gemini import EMBED_DIMENSIONS, GeminiProvider, is_window_overflow
 from core.embedding_builder import (
     EXPECTED_DIMENSIONS,
@@ -1132,6 +1133,365 @@ class CaptureSourceMetadataApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.data["metadata"])
         self.assertIsNone(response.data["source_url"])
+
+
+class CaptureMetadataMergeApiTests(APITestCase):
+    """Section 4 (B3 + B4 + B5): the schema-aware capture serializer.
+
+    Recognized model fields validate against their own columns; eligible
+    extra top-level fields merge into the JSON ``metadata``; explicit
+    ``metadata`` wins key conflicts; server-managed fields are
+    untouchable; the merged object is gated on structure and size.
+    """
+
+    def setUp(self):
+        self.user_a = get_user_model().objects.create_user(
+            "a", "a@example.com", "pw"
+        )
+        self.user_b = get_user_model().objects.create_user(
+            "b", "b@example.com", "pw"
+        )
+        # Stored media must land in a throwaway root, not the repo's.
+        ctx = _isolated_media_root()
+        self.tmp_root = ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        patcher = patch("core.pipeline.async_task")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _capture_from_response(self, response) -> Capture:
+        return Capture.objects.get(
+            capture_id=uuid.UUID(response.data["capture_id"])
+        )
+
+    def test_multipart_file_parts_are_contract_not_metadata(self):
+        # DRF merges uploaded file parts into request.data (that is how
+        # declared file fields read them); they must never be swept
+        # into metadata as if they were extra fields.
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": "some text",
+                "media": json.dumps(
+                    {"images": [{"url": "https://origin.example/a.jpg"}]}
+                ),
+                "file:images:0": SimpleUploadedFile(
+                    "a.jpg", b"image-bytes", content_type="image/jpeg"
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertEqual(capture.metadata, {})
+        # ...and the file part is still stored through the normal path.
+        self.assertEqual(len(capture.image_sources), 1)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tmp_root, capture.image_sources[0]["url"]))
+        )
+
+    def test_dedicated_field_lands_in_its_column_not_metadata(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": ["some text"],
+                "source_url": "https://example.com/article",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertEqual(capture.source_url, "https://example.com/article")
+        # A recognized field stores in its own column, never swept into
+        # metadata as if it were an extra field.
+        self.assertEqual(capture.metadata, {})
+
+    def test_explicit_metadata_is_saved_and_returned(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": ["some text"],
+                "metadata": {"title": "T", "site": "example.com"},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(
+            response.data["metadata"], {"title": "T", "site": "example.com"}
+        )
+        capture = self._capture_from_response(response)
+        self.assertEqual(
+            capture.metadata, {"title": "T", "site": "example.com"}
+        )
+        # Round trip: a later retrieve returns the stored object intact.
+        response = self.client.get(f"/captures/{capture.capture_id}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["metadata"], {"title": "T", "site": "example.com"}
+        )
+
+    def test_extra_fields_without_columns_are_collected_into_metadata(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": ["some text"],
+                "og_title": "Page title",
+                "og_site": "example.com",
+                "article_count": 3,
+                "is_draft": False,
+                "score": None,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertEqual(
+            capture.metadata,
+            {
+                "og_title": "Page title",
+                "og_site": "example.com",
+                "article_count": 3,
+                "is_draft": False,
+                "score": None,
+            },
+        )
+
+    def test_omitted_metadata_with_extras_still_saves(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {"text": ["some text"], "og_title": "Page title"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["metadata"], {"og_title": "Page title"})
+        capture = self._capture_from_response(response)
+        self.assertEqual(capture.metadata, {"og_title": "Page title"})
+
+    def test_metadata_and_extras_combine_with_deterministic_conflict(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": ["some text"],
+                "metadata": {"title": "from-metadata"},
+                "title": "from-top-level",
+                "author": "a",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        # Neither side is lost, and the same-named key resolves
+        # deterministically: the explicit metadata object wins.
+        self.assertEqual(
+            capture.metadata, {"title": "from-metadata", "author": "a"}
+        )
+
+    def test_multipart_extras_and_metadata_combine(self):
+        # The extension's path: extras as plain form fields, the metadata
+        # object as a JSON string; the same conflict rule applies.
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": "some text",
+                "metadata": json.dumps(
+                    {"lang": "en", "title": "from-metadata"}
+                ),
+                "title": "from-top-level",
+                "author": "a",
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertEqual(
+            capture.metadata,
+            {"lang": "en", "title": "from-metadata", "author": "a"},
+        )
+
+    def test_contract_fields_are_never_metadata(self):
+        # `text`/`media`/`image` are request-level carriers (create()
+        # consumes them): they must not be swept into metadata.
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": ["some text"],
+                "media": {"images": [{"url": "https://example.com/i.png"}]},
+                "image": _png_data_uri(),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertEqual(capture.metadata, {})
+
+    def test_invalid_metadata_structures_are_rejected(self):
+        self.client.force_authenticate(self.user_a)
+        for bad in (["a", "list"], "a plain string", 42):
+            with self.subTest(metadata=bad):
+                response = self.client.post(
+                    "/captures/",
+                    {"text": ["some text"], "metadata": bad},
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 400)
+        # A malformed JSON object on the extension's multipart path.
+        response = self.client.post(
+            "/captures/",
+            {"text": "some text", "metadata": "{not json"},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Capture.objects.count(), 0)
+
+    def test_overdeep_metadata_is_rejected(self):
+        self.client.force_authenticate(self.user_a)
+        from core.api.serializers import METADATA_MAX_DEPTH
+
+        deep = {"a": "v"}
+        for _ in range(METADATA_MAX_DEPTH + 2):
+            deep = {"a": deep}
+        response = self.client.post(
+            "/captures/",
+            {"text": ["some text"], "metadata": deep},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Capture.objects.count(), 0)
+
+    def test_oversized_keys_are_rejected(self):
+        self.client.force_authenticate(self.user_a)
+        with override_settings(METADATA_MAX_KEY_LENGTH=8):
+            response = self.client.post(
+                "/captures/",
+                {"text": ["some text"], "metadata": {"a" * 9: "v"}},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 400)
+        # The same payload under the default limit (128) is fine.
+        response = self.client.post(
+            "/captures/",
+            {"text": ["some text"], "metadata": {"a" * 9: "v"}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Capture.objects.count(), 1)
+
+    def test_metadata_over_the_size_limit_is_rejected(self):
+        self.client.force_authenticate(self.user_a)
+        # Well under the 64 KiB default: fine.
+        response = self.client.post(
+            "/captures/",
+            {"text": ["some text"], "metadata": {"blob": "x" * 1000}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        # The limit is the setting: tighten it and the same payload is
+        # rejected, along with anything merged in through an extra field.
+        with override_settings(METADATA_MAX_SIZE=10):
+            with self.subTest(carrier="metadata"):
+                response = self.client.post(
+                    "/captures/",
+                    {
+                        "text": ["some text"],
+                        "metadata": {"blob": "x" * 1000},
+                    },
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 400)
+            with self.subTest(carrier="extra"):
+                response = self.client.post(
+                    "/captures/",
+                    {"text": ["some text"], "big_extra": "x" * 1000},
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 400)
+        self.assertEqual(Capture.objects.count(), 1)
+
+    def test_server_managed_fields_cannot_be_overridden(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": ["some text"],
+                "user": self.user_b.pk,
+                "capture_id": "11111111-1111-1111-1111-111111111111",
+                "status": "ready",
+                "error_note": "injected",
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        # Ownership, identity, and pipeline state are all server-managed:
+        # the supplied values never land.
+        self.assertEqual(capture.user_id, self.user_a.id)
+        self.assertNotEqual(
+            str(capture.capture_id), "11111111-1111-1111-1111-111111111111"
+        )
+        self.assertEqual(
+            str(capture.capture_id), str(uuid.UUID(response.data["capture_id"]))
+        )
+        self.assertEqual(capture.status, Capture.Status.PENDING)
+        self.assertIsNone(capture.error_note)
+        self.assertGreater(
+            capture.created_at, timezone.now() - timedelta(hours=1)
+        )
+        # ...and none of it leaks into metadata either.
+        self.assertEqual(capture.metadata, {})
+
+    def test_recognized_fields_are_the_model_schema_itself(self):
+        # Schema awareness: "recognized" is the serializer's own field
+        # map, which DRF builds from the model — with fields="__all__"
+        # that is exactly the model's concrete fields, so no duplicate
+        # list can drift from the schema.
+        serializer = CaptureSerializer()
+        model_fields = {field.name for field in Capture._meta.fields}
+        self.assertEqual(set(serializer.fields), model_fields)
+        # And behaviorally: a recognized key goes to its column, an
+        # unrecognized one to metadata.
+        result = serializer.to_internal_value(
+            {"source_url": "https://example.com/", "brand_new_property": "v"}
+        )
+        self.assertEqual(result["source_url"], "https://example.com/")
+        self.assertEqual(result["metadata"], {"brand_new_property": "v"})
+
+    def test_create_retrieve_round_trip_is_consistent(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": ["some text"],
+                "source_url": "https://example.com/article",
+                "metadata": {"site": "example.com"},
+                "title": "Article title",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(
+            response.data["metadata"],
+            {"site": "example.com", "title": "Article title"},
+        )
+        capture = self._capture_from_response(response)
+        response = self.client.get(f"/captures/{capture.capture_id}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["source_url"], "https://example.com/article"
+        )
+        self.assertEqual(
+            response.data["metadata"],
+            {"site": "example.com", "title": "Article title"},
+        )
 
 
 # ---------------------------------------------------------------------------

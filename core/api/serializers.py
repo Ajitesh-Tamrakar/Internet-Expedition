@@ -1,16 +1,146 @@
 import base64
 import json
+import math
 import os
 import re
 import uuid
 from pathlib import Path
 
 from django.conf import settings
-from django.core.files.base import ContentFile
+from django.core.files.base import ContentFile, File
+from django.db import models
 from rest_framework import serializers
 
 from core import storage as media_storage
 from core.models import Capture, CaptureContext, CaptureEmbedding
+
+
+# ---------------------------------------------------------------------------
+# Smart metadata (section 4: B3 + B4 + B5)
+#
+# The capture payload is a superset of the historical contract: the
+# extension's metadata format evolves as more kinds of saved content are
+# supported, so the serializer is schema-aware instead of a fixed field
+# list:
+#   * a key with a dedicated model column (source_url, metadata, ...) is
+#     recognized *because the serializer's field map is built from the
+#     model* and validates against that column as before;
+#   * an eligible extra key with no dedicated column is merged into the
+#     JSON `metadata` field, so a new property needs no migration;
+#   * server-managed names (identity, ownership, pipeline state) are
+#     derived from the model schema — never a hand-maintained duplicate
+#     list — and can never reach the model from client input.
+# ---------------------------------------------------------------------------
+
+# Request-level carrier keys: they appear in the payload but are not model
+# fields — create() consumes them directly (the `text`/`media` JSON and
+# the screenshot's `image` data-URL / file part). They are contract, not
+# metadata, and must never be swept into `metadata` as if they were extra
+# fields.
+CONTRACT_FIELDS = frozenset({"text", "media", "image"})
+
+# Deeper than any metadata worth keeping: a structural guard on the merged
+# object, not a tunable knob.
+METADATA_MAX_DEPTH = 32
+
+
+def server_managed_field_names() -> frozenset:
+    """The names a client must never be able to write on a Capture.
+
+    Derived from the model's own schema plus the serializer's own
+    read-only declaration — never a hand-maintained duplicate list:
+    the primary key (identity), relational fields (ownership),
+    auto-managed timestamps, and every field the serializer marks
+    read-only (the pipeline's `status` / `error_note`).
+    """
+    names = set()
+    for field in Capture._meta.fields:
+        # auto_now/auto_now_add exist only on DateTimeField; the
+        # getattr fallback keeps the check uniform across field types.
+        if (
+            field.primary_key
+            or getattr(field, "auto_now", False)
+            or getattr(field, "auto_now_add", False)
+            or isinstance(
+                field,
+                (
+                    models.ForeignKey,
+                    models.OneToOneField,
+                    models.ManyToManyField,
+                ),
+            )
+        ):
+            names.add(field.name)
+    names.update(CaptureSerializer.Meta.read_only_fields)
+    return frozenset(names)
+
+
+def assert_acceptable_metadata(metadata: dict, max_key_length: int) -> None:
+    """Raise ValidationError when the merged metadata is not acceptable
+    JSON.
+
+    Keys must be non-empty strings within the length gate; values must
+    be plain JSON (string/number/boolean/null/list/object) with finite
+    numbers; nesting must stay within METADATA_MAX_DEPTH. Checking
+    value types here also guarantees the later json.dumps size gate can
+    never fail with a 500 on an exotic object.
+    """
+
+    def walk(value, depth: int) -> None:
+        if isinstance(value, dict):
+            if depth > METADATA_MAX_DEPTH:
+                raise serializers.ValidationError(
+                    {
+                        "metadata": (
+                            "must be nested no more than "
+                            f"{METADATA_MAX_DEPTH} levels deep."
+                        )
+                    }
+                )
+            for key, item in value.items():
+                if not isinstance(key, str) or not 1 <= len(key) <= max_key_length:
+                    raise serializers.ValidationError(
+                        {
+                            "metadata": (
+                                "keys must be non-empty strings of at most "
+                                f"{max_key_length} characters."
+                            )
+                        }
+                    )
+                walk(item, depth + 1)
+        elif isinstance(value, list):
+            if depth > METADATA_MAX_DEPTH:
+                raise serializers.ValidationError(
+                    {
+                        "metadata": (
+                            "must be nested no more than "
+                            f"{METADATA_MAX_DEPTH} levels deep."
+                        )
+                    }
+                )
+            for item in value:
+                walk(item, depth + 1)
+        elif value is None or isinstance(value, (str, bool)):
+            return
+        elif isinstance(value, int):
+            return
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise serializers.ValidationError(
+                    {"metadata": "numbers must be finite."}
+                )
+            return
+        else:
+            raise serializers.ValidationError(
+                {
+                    "metadata": (
+                        "values must be strings, numbers, booleans, null, "
+                        "lists, or objects."
+                    )
+                }
+            )
+
+    walk(metadata, 0)
 
 
 class CaptureSerializer(serializers.ModelSerializer):
@@ -21,6 +151,86 @@ class CaptureSerializer(serializers.ModelSerializer):
         # client's: the client polls status, it never sets it (retry
         # goes through POST /captures/<id>/retry/).
         read_only_fields = ["user", "status", "error_note"]
+
+    def to_internal_value(self, data):
+        """Validate the payload, then merge eligible extra fields into
+        ``metadata``.
+
+        Schema-aware: a key is *recognized* when it has a dedicated
+        model column — that is exactly the serializer's own field map
+        (DRF builds it from the model, so there is no duplicate list to
+        keep in sync) — and it validates against that column as before.
+        Any other eligible top-level key (the extension may gain
+        properties without a migration) is merged into the JSON
+        ``metadata`` field:
+
+        * explicit ``metadata`` wins over a same-named extra field —
+          the deterministic conflict rule: the client said it on
+          purpose;
+        * ``metadata`` omitted → the model default ({});
+        * ``metadata`` null with no extra fields → null (preserved,
+          section 1 behavior);
+        * ``metadata`` null with extra fields → a dict of the extras
+          (they need a home; dropping them would lose data).
+
+        ``CONTRACT_FIELDS`` (``text``/``media``/``image``) are the
+        request-level carriers create() consumes directly: not
+        metadata, never merged. Uploaded file parts likewise: for
+        multipart requests DRF surfaces them inside ``data`` (that is
+        how declared file fields read), and create() consumes them
+        from ``request.FILES`` — never merged. Server-managed names
+        (see ``server_managed_field_names``) are read-only fields,
+        which DRF already ignores in input, and are additionally kept
+        out of the merge so they can never leak into the stored object.
+        """
+        result = super().to_internal_value(data)
+        result["metadata"] = self._merged_metadata(data, result)
+        return result
+
+    def _merged_metadata(self, data, validated: dict):
+        """Build the final ``metadata`` value from the explicit field
+        plus the eligible extra top-level keys. Raises ValidationError
+        for ineligible keys/values, an over-deep/over-structured
+        object, or an object over the size gate."""
+        max_size = getattr(settings, "METADATA_MAX_SIZE", 64 * 1024)
+        max_key_length = getattr(settings, "METADATA_MAX_KEY_LENGTH", 128)
+
+        recognized = set(self.fields)
+        protected = server_managed_field_names()
+
+        extras = {}
+        for key, value in data.items():
+            if key in recognized or key in CONTRACT_FIELDS or key in protected:
+                continue
+            # For multipart requests DRF merges the uploaded file parts
+            # into request.data (in addition to request.FILES, where
+            # create() reads them — see _attached). A file object is
+            # contract, not a metadata value.
+            if isinstance(value, File):
+                continue
+            extras[key] = value
+
+        merged = dict(extras)
+        if "metadata" in validated:
+            meta = validated["metadata"]
+            if meta:
+                # Conflict rule: the explicit metadata object wins.
+                merged.update(meta)
+            elif not extras:
+                # An explicit null with nothing else to house stays null.
+                return None
+
+        assert_acceptable_metadata(merged, max_key_length)
+        size = len(json.dumps(merged, ensure_ascii=False).encode("utf-8"))
+        if size > max_size:
+            raise serializers.ValidationError(
+                {
+                    "metadata": (
+                        f"exceeds the {max_size} byte limit ({size} bytes)."
+                    )
+                }
+            )
+        return merged
 
     def create(self, validated_data):
         """Create the capture, and store its media in the storage backend.
@@ -128,8 +338,10 @@ class CaptureSerializer(serializers.ModelSerializer):
             text_sources=text,
             source_url=validated_data.get("source_url"),
         )
-        # Absent metadata stays at the model default ({}); explicit values
-        # (object or null) land on the field as validated.
+        # to_internal_value always lands the merged value here (see
+        # _merged_metadata): {} when the client sent neither metadata nor
+        # eligible extra fields, the explicit object, the merged object,
+        # or null.
         if "metadata" in validated_data:
             capture.metadata = validated_data["metadata"]
         capture_id = str(capture.capture_id)
@@ -272,21 +484,6 @@ class CaptureSerializer(serializers.ModelSerializer):
                 "metadata must be a JSON object (or null)."
             )
         return value
-
-    def to_representation(self, instance):
-        response = super().to_representation(instance)
-
-        if "image_sources" in response:
-            del response["image_sources"]
-        if "video_sources" in response:
-            del response["video_sources"]
-        if "audio_sources" in response:
-            del response["audio_sources"]
-        if "text_sources" in response:
-            del response["text_sources"]
-
-        response["capture"] = "success"
-        return response
 
     def to_representation(self, instance):
         response = super().to_representation(instance)

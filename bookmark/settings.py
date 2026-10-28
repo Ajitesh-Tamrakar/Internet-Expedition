@@ -383,6 +383,15 @@ MEDIA_MAX_FILE_BYTES = env.int("MEDIA_MAX_FILE_BYTES", default=50 * 1024 * 1024)
 MEDIA_MAX_TOTAL_PER_CAPTURE = env.int("MEDIA_MAX_TOTAL_PER_CAPTURE", default=200 * 1024 * 1024)
 MEDIA_DOWNLOAD_TIMEOUT = env.float("MEDIA_DOWNLOAD_TIMEOUT", default=60.0)
 
+# ------------------------------------------------------------------
+# Capture metadata (the smart serializer, section 4): eligible extra
+# request fields are merged into the JSON `metadata` column, so the
+# merged object is gated like any other client-supplied text — the
+# serialized size and the key length must stay within these bounds.
+# ------------------------------------------------------------------
+METADATA_MAX_SIZE = env.int("METADATA_MAX_SIZE", default=64 * 1024)
+METADATA_MAX_KEY_LENGTH = env.int("METADATA_MAX_KEY_LENGTH", default=128)
+
 STORAGES = {
     "default": {
         "BACKEND": (
