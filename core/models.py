@@ -41,6 +41,13 @@ class Capture(models.Model):
     video_sources = models.JSONField(null=True, blank=True, default=list)
     audio_sources = models.JSONField(null=True, blank=True, default=list)
     text_sources = models.JSONField(null=True, blank=True, default=list)
+    # The original URL the capture was saved from (where the content came
+    # from). Null for captures with no page behind them (raw pastes).
+    source_url = models.CharField(max_length=2048, null=True, blank=True)
+    # Free-form, client-supplied JSON object (e.g. the saved page's
+    # title/author/site). Absent input -> {} (the same null=True,
+    # default=empty-container convention as the *_sources fields).
+    metadata = models.JSONField(null=True, blank=True, default=dict)
     # Where the background pipeline is with this capture (see Status).
     # Clients poll this; the recovery sweep trusts it.
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.PENDING)

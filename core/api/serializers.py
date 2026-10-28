@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import re
 import uuid
 from pathlib import Path
@@ -35,6 +36,12 @@ class CaptureSerializer(serializers.ModelSerializer):
           position in the ``media.<kind>`` list). An item with a paired
           file part is stored *now*, during this request, and its entry
           keeps the original URL as ``original_url``.
+        * The screenshot has two carriers: a multipart file part named
+          ``file:image:0`` (the extension's contract — raw bytes, no
+          base64 overhead) or a base64 data-URL string in the ``image``
+          field (the historical JSON contract, kept for other clients).
+          Both are stored *now*, in the web process, under the capture's
+          own prefix; when both are present the file part wins.
 
         Both forms may be mixed in one request, and every item shape
         the old client sends is accepted unchanged.
@@ -88,9 +95,12 @@ class CaptureSerializer(serializers.ModelSerializer):
             return attached
 
         # Size gates, checked before anything is stored: a rejection
-        # here means no capture row and no orphaned objects.
+        # here means no capture row and no orphaned objects. ``image``
+        # is the screenshot's part family (``file:image:<index>``): the
+        # screenshot is a single item, but it obeys the same per-file
+        # and per-capture caps as the media parts.
         total_size = 0
-        for kind in ("images", "videos", "audios"):
+        for kind in ("image", "images", "videos", "audios"):
             for index, file in _attached(kind).items():
                 if file.size > max_file:
                     raise serializers.ValidationError(
@@ -113,7 +123,15 @@ class CaptureSerializer(serializers.ModelSerializer):
         # Build the instance first: its UUID (the storage prefix) exists
         # from construction, so attached files can be uploaded before the
         # row is inserted — a failed upload then leaves no row behind.
-        capture = Capture(user=validated_data["user"], text_sources=text)
+        capture = Capture(
+            user=validated_data["user"],
+            text_sources=text,
+            source_url=validated_data.get("source_url"),
+        )
+        # Absent metadata stays at the model default ({}); explicit values
+        # (object or null) land on the field as validated.
+        if "metadata" in validated_data:
+            capture.metadata = validated_data["metadata"]
         capture_id = str(capture.capture_id)
 
         def _stored_name(kind: str, source_id: str, ext: str) -> str:
@@ -154,8 +172,53 @@ class CaptureSerializer(serializers.ModelSerializer):
         audio_sources = _build_sources("audios")
 
         image = data.get("image") or ""
+        # The file-part carrier: ``file:image:0``. The screenshot is a
+        # single item (the ``:0`` is the contract, not a list index), so
+        # any ``file:image:<n>`` part present is taken as the screenshot
+        # — a misnumbered part must never be silently dropped.
+        attached_screenshots = _attached("image")
+        screenshot_part = (
+            attached_screenshots[min(attached_screenshots)]
+            if attached_screenshots
+            else None
+        )
+
         screenshot = None
-        if image:
+        if screenshot_part is not None:
+            # A file part beats a data-URL string when both are present
+            # (it is the better carrier); the string is then simply not
+            # consulted.
+            content_type = (
+                (screenshot_part.content_type or "").split(";")[0].strip().lower()
+            )
+            if content_type not in ("image/png", "image/jpeg"):
+                # A client that cannot supply a content type (or sends the
+                # generic octet-stream) is judged by the filename instead:
+                # a .png/.jpg/.jpeg name is still a plausible screenshot.
+                name_ext = os.path.splitext(screenshot_part.name or "")[1].lower()
+                if not (
+                    content_type in ("", "application/octet-stream")
+                    and name_ext in (".png", ".jpg", ".jpeg")
+                ):
+                    raise serializers.ValidationError(
+                        {"image": "must be a PNG or JPEG image"}
+                    )
+            # Extension from the content type (mirrors the data-URL path,
+            # which gets its extension from the data-URL's own prefix);
+            # the filename is the fallback when the type was unknown.
+            ext = media_storage.EXT_BY_CONTENT_TYPE.get(
+                content_type,
+                media_storage.extension_for(screenshot_part.name),
+            )
+
+            # The web process has the bytes in hand: the screenshot
+            # uploads to the storage backend during this request (the
+            # ImageField routes through the default backend — Supabase
+            # when configured, local disk otherwise).
+            screenshot = ContentFile(
+                screenshot_part.read(), name=f"screenshot{ext}"
+            )
+        elif image:
             match = re.match(r"^data:image/(png|jpeg);base64,(.+)$", image)
 
             if not match:
@@ -190,6 +253,15 @@ class CaptureSerializer(serializers.ModelSerializer):
             ) from err
 
         return capture
+
+    def validate_metadata(self, value):
+        """metadata is a JSON *object* (or null): a list or scalar has no
+        home there (the *_sources lists already have their own fields)."""
+        if value is not None and not isinstance(value, dict):
+            raise serializers.ValidationError(
+                "metadata must be a JSON object (or null)."
+            )
+        return value
 
     def to_representation(self, instance):
         response = super().to_representation(instance)

@@ -905,6 +905,165 @@ class CaptureApiAutomationTests(APITestCase):
         self.assertEqual(response.status_code, 404)
 
 
+class CaptureSourceMetadataTests(TestCase):
+    """Section 1 (B1 + B2): source_url + metadata on Capture, model level.
+
+    The test runner builds its database by applying the migrations, so a
+    passing run is also the proof that migration 0006 applies cleanly.
+    """
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            "a", "a@example.com", "pw"
+        )
+
+    def test_absent_values_follow_the_sources_convention(self):
+        # The additive columns are nullable; a plain ORM create leaves
+        # source_url NULL and takes the model default for metadata.
+        source_url = Capture._meta.get_field("source_url")
+        self.assertTrue(source_url.null)
+        self.assertTrue(source_url.blank)
+        metadata = Capture._meta.get_field("metadata")
+        self.assertTrue(metadata.null)
+        self.assertTrue(metadata.blank)
+        self.assertEqual(metadata.get_default(), {})
+
+        capture = Capture.objects.create(user=self.user)
+        capture.refresh_from_db()
+        self.assertIsNone(capture.source_url)
+        self.assertEqual(capture.metadata, {})
+
+    def test_round_trip_preserves_values(self):
+        capture = Capture.objects.create(
+            user=self.user,
+            source_url="https://example.com/article",
+            metadata={"title": "Article title", "site": "example.com"},
+        )
+        capture.refresh_from_db()
+        self.assertEqual(capture.source_url, "https://example.com/article")
+        self.assertEqual(
+            capture.metadata, {"title": "Article title", "site": "example.com"}
+        )
+
+
+class CaptureSourceMetadataApiTests(APITestCase):
+    """POST /captures/ + GET /captures/<id>/ with source_url + metadata."""
+
+    def setUp(self):
+        self.user_a = get_user_model().objects.create_user(
+            "a", "a@example.com", "pw"
+        )
+        patcher = patch("core.pipeline.async_task")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _capture_from_response(self, response) -> Capture:
+        return Capture.objects.get(
+            capture_id=uuid.UUID(response.data["capture_id"])
+        )
+
+    def test_create_with_source_url_and_metadata_round_trips(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": ["some text"],
+                "source_url": "https://example.com/article",
+                "metadata": {"title": "Article title", "site": "example.com"},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(
+            response.data["source_url"], "https://example.com/article"
+        )
+        self.assertEqual(
+            response.data["metadata"],
+            {"title": "Article title", "site": "example.com"},
+        )
+        # The row carries both, and a later retrieve returns both.
+        capture = self._capture_from_response(response)
+        self.assertEqual(capture.source_url, "https://example.com/article")
+        self.assertEqual(
+            capture.metadata, {"title": "Article title", "site": "example.com"}
+        )
+        response = self.client.get(f"/captures/{capture.capture_id}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["source_url"], "https://example.com/article"
+        )
+        self.assertEqual(
+            response.data["metadata"],
+            {"title": "Article title", "site": "example.com"},
+        )
+
+    def test_create_without_metadata_or_source_url(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/", {"text": ["some text"]}, format="json"
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["metadata"], {})
+        self.assertIsNone(response.data["source_url"])
+        capture = self._capture_from_response(response)
+        self.assertEqual(capture.metadata, {})
+        self.assertIsNone(capture.source_url)
+
+    def test_explicit_null_metadata_is_preserved(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {"text": ["some text"], "metadata": None},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIsNone(response.data["metadata"])
+        capture = self._capture_from_response(response)
+        self.assertIsNone(capture.metadata)
+
+    def test_non_object_metadata_is_rejected(self):
+        self.client.force_authenticate(self.user_a)
+        for bad in (["a", "list"], "a plain string", 42):
+            with self.subTest(metadata=bad):
+                response = self.client.post(
+                    "/captures/",
+                    {"text": ["some text"], "metadata": bad},
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 400)
+        self.assertEqual(Capture.objects.count(), 0)
+
+    def test_multipart_form_fields_round_trip(self):
+        # The extension's path: source_url as a plain form field, metadata
+        # as a JSON string.
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": "some text",
+                "source_url": "https://example.com/post",
+                "metadata": json.dumps({"title": "Post", "lang": "en"}),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertEqual(capture.source_url, "https://example.com/post")
+        self.assertEqual(capture.metadata, {"title": "Post", "lang": "en"})
+
+    def test_legacy_rows_still_serve(self):
+        # A pre-migration row: both columns NULL. GET must still work.
+        capture = Capture.objects.create(user=self.user_a)
+        Capture.objects.filter(pk=capture.pk).update(
+            metadata=None, source_url=None
+        )
+        self.client.force_authenticate(self.user_a)
+        response = self.client.get(f"/captures/{capture.capture_id}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data["metadata"])
+        self.assertIsNone(response.data["source_url"])
+
+
 # ---------------------------------------------------------------------------
 # Passwordless email-OTP authentication
 # ---------------------------------------------------------------------------
@@ -1533,7 +1692,12 @@ def _local_storage(tmp: str) -> FileSystemStorage:
 def _isolated_media_root():
     """Context manager: the *default* Django storage resolves to a
     throwaway directory (and the lazy object is reset around it), so
-    file-backed tests never touch the repository's media/ directory."""
+    file-backed tests never touch the repository's media/ directory.
+
+    The STORAGES override pins ``default`` to the local-disk backend
+    *regardless of .env*: a checkout with SUPABASE_URL set would
+    otherwise route every save in here to the live bucket (the helper's
+    MEDIA_ROOT override is meaningless to SupabaseStorage)."""
     tmp = tempfile.mkdtemp(prefix="bm-media-")
 
     @contextlib.contextmanager
@@ -1541,7 +1705,20 @@ def _isolated_media_root():
         from django.core.files import storage as _dj_storage
         from django.utils.functional import empty
 
-        with override_settings(MEDIA_ROOT=tmp):
+        with override_settings(
+            MEDIA_ROOT=tmp,
+            STORAGES={
+                "default": {
+                    "BACKEND": "django.core.files.storage.FileSystemStorage"
+                },
+                "staticfiles": {
+                    "BACKEND": (
+                        "django.core.files.staticfiles.storage"
+                        ".StaticFilesStorage"
+                    )
+                },
+            },
+        ):
             # Re-resolve the default storage against this MEDIA_ROOT: the
             # StorageHandler memoizes constructed backends, and the lazy
             # object only re-runs _setup() when _wrapped is the `empty`
@@ -1558,12 +1735,16 @@ def _isolated_media_root():
     return _ctx()
 
 
-def _png_data_uri() -> str:
+def _png_bytes() -> bytes:
     from PIL import Image
 
     buf = io.BytesIO()
     Image.new("RGB", (4, 4), (255, 0, 0)).save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    return buf.getvalue()
+
+
+def _png_data_uri() -> str:
+    return "data:image/png;base64," + base64.b64encode(_png_bytes()).decode()
 
 
 class StorageLayoutTests(TestCase):
@@ -2060,6 +2241,150 @@ class CaptureMediaApiTests(APITestCase):
         )
         # The client gets a usable URL for the screenshot.
         self.assertTrue(response.data["screenshot"])
+
+    def test_multipart_data_url_string_still_works(self):
+        """Regression: the data-URL carrier (here as a multipart form
+        field, its historical bridge shape) is unchanged by the part."""
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {"text": "some text", "image": _png_data_uri()},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertTrue(capture.screenshot)
+        self.assertTrue(
+            capture.screenshot.name.endswith("screenshot.png")
+        )
+        self.assertTrue(response.data["screenshot"])
+
+    def test_screenshot_file_part_is_stored_at_creation(self):
+        self.client.force_authenticate(self.user_a)
+        png = _png_bytes()
+        response = self.client.post(
+            "/captures/",
+            {
+                "text": "some text",
+                # No extension in the name: the stored extension comes
+                # from the content type.
+                "file:image:0": SimpleUploadedFile(
+                    "screenshot", png, content_type="image/png"
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertTrue(capture.screenshot)
+        self.assertEqual(
+            capture.screenshot.name, f"{capture.capture_id}/screenshot.png"
+        )
+        with open(
+            os.path.join(self.tmp_root, capture.screenshot.name), "rb"
+        ) as fh:
+            self.assertEqual(fh.read(), png)
+        # The client gets a usable URL for the screenshot.
+        self.assertTrue(response.data["screenshot"])
+
+    def test_screenshot_part_generic_content_type_uses_filename(self):
+        """A client that cannot supply a content type (octet-stream) is
+        judged by the filename: a .jpg name is still a screenshot."""
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "file:image:0": SimpleUploadedFile(
+                    "screenshot.jpg", b"jpeg-bytes",
+                    content_type="application/octet-stream",
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        self.assertEqual(
+            capture.screenshot.name, f"{capture.capture_id}/screenshot.jpg"
+        )
+
+    def test_screenshot_file_part_over_per_file_cap_is_400(self):
+        self.client.force_authenticate(self.user_a)
+        with override_settings(MEDIA_MAX_FILE_BYTES=10):
+            response = self.client.post(
+                "/captures/",
+                {
+                    "file:image:0": SimpleUploadedFile(
+                        "screenshot", b"x" * 100, content_type="image/png"
+                    ),
+                },
+                format="multipart",
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Capture.objects.count(), 0)
+        self.assertEqual(os.listdir(self.tmp_root), [])  # nothing stored
+
+    def test_screenshot_part_counts_toward_the_total_cap(self):
+        self.client.force_authenticate(self.user_a)
+        with override_settings(
+            MEDIA_MAX_FILE_BYTES=10_000, MEDIA_MAX_TOTAL_PER_CAPTURE=150
+        ):
+            response = self.client.post(
+                "/captures/",
+                {
+                    "media": json.dumps(
+                        {"images": [{"url": "https://o/a.jpg"}]}
+                    ),
+                    "file:images:0": SimpleUploadedFile(
+                        "a.jpg", b"x" * 100, content_type="image/jpeg"
+                    ),
+                    "file:image:0": SimpleUploadedFile(
+                        "screenshot", b"y" * 100, content_type="image/png"
+                    ),
+                },
+                format="multipart",
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Capture.objects.count(), 0)
+        self.assertEqual(os.listdir(self.tmp_root), [])  # nothing stored
+
+    def test_screenshot_file_part_invalid_type_is_400(self):
+        self.client.force_authenticate(self.user_a)
+        response = self.client.post(
+            "/captures/",
+            {
+                "file:image:0": SimpleUploadedFile(
+                    "report.pdf", b"not-an-image",
+                    content_type="application/pdf",
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("image", response.data)
+        self.assertEqual(Capture.objects.count(), 0)
+        self.assertEqual(os.listdir(self.tmp_root), [])  # nothing stored
+
+    def test_file_part_wins_over_data_url_string(self):
+        """Both carriers present: the file part is the screenshot, the
+        string is not consulted."""
+        self.client.force_authenticate(self.user_a)
+        part_bytes = b"part-bytes"
+        response = self.client.post(
+            "/captures/",
+            {
+                "image": _png_data_uri(),
+                "file:image:0": SimpleUploadedFile(
+                    "screenshot", part_bytes, content_type="image/png"
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        capture = self._capture_from_response(response)
+        with open(
+            os.path.join(self.tmp_root, capture.screenshot.name), "rb"
+        ) as fh:
+            self.assertEqual(fh.read(), part_bytes)
 
     def test_multipart_media_field_must_be_json(self):
         self.client.force_authenticate(self.user_a)
