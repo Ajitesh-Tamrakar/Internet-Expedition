@@ -1,0 +1,44 @@
+/* Base styles for the Internet Expedition client.
+   Intentionally minimal — the Vite starter CSS has been removed. Page-level
+   styles land with the pages that need them. */
+
+:root {
+  color-scheme: light dark;
+  --text: #1a1a1a;
+  --bg: #fafafa;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #f3f4f6;
+    --bg: #111318;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100svh;
+}
+
+.app-shell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100svh;
+}
