@@ -6,6 +6,7 @@ dump/
 
 # Environment
 .env
+.env.prod
 
 # Editor / OS
 .vscode/

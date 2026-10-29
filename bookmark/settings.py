@@ -23,6 +23,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # SECURITY WARNING: keep the secret key used in production secret!
 env = environ.Env()
 environ.Env.read_env(os.path.join(BASE_DIR, '.env'), overwrite=False)
+# Optional env profile (e.g. `DJANGO_ENV_FILE=.env.prod`): loaded after `.env`
+# with overwrite=True so its values win — the only supported way to retarget
+# the app at the prod DB without editing `.env`.
+if profile := os.environ.get('DJANGO_ENV_FILE'):
+    environ.Env.read_env(os.path.join(BASE_DIR, profile), overwrite=True)
 
 SECRET_KEY = env('DJANGO_SECRET_KEY', default=env('SECRET_KEY', default='django-insecure-local-dev-only')) #type: ignore
 DEBUG = env.bool('DJANGO_DEBUG', default=env.bool('DEBUG', default=False))
