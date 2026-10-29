@@ -13,7 +13,6 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 from pathlib import Path
 import environ
 import os
-from datetime import timedelta
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -124,14 +123,13 @@ INSTALLED_APPS = [
     'django.contrib.sites',
 
     'rest_framework',
-    'rest_framework_simplejwt.token_blacklist',
 
+    # django-allauth 65 — account + the headless API (allauth.headless is
+    # required: HEADLESS_ENABLED keys off its presence in INSTALLED_APPS).
     'allauth',
     'allauth.account',
+    'allauth.headless',
     'allauth.socialaccount',
-
-    'dj_rest_auth',
-    'dj_rest_auth.registration',
 
     'core',
     'django_q',
@@ -146,6 +144,9 @@ MIDDLEWARE = [
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'allauth.account.middleware.AccountMiddleware',
+    # Moves the allauth refresh token out of the JSON meta and into the
+    # HttpOnly cookie (see core.auth.middleware for the full picture).
+    'core.auth.middleware.RefreshCookieMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     # 'core.middleware.SetupRequiredMiddleware',
@@ -154,69 +155,54 @@ MIDDLEWARE = [
 ROOT_URLCONF = 'bookmark.urls'
 
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES':(
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    # Allauth's built-in JWT strategy (allauth.headless.contrib
+    # .rest_framework.authentication): validates the signed access token
+    # from the Authorization header and resolves the user.
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'allauth.headless.contrib.rest_framework.authentication.JWTTokenAuthentication',
     ),
 
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
-
-    # The OTP endpoints are unauthenticated, so they throttle per IP.
-    'DEFAULT_THROTTLE_RATES': {
-        'otp': '5/min',          # registration / login request / resend
-        'otp_confirm': '10/min', # code confirmation
-    },
-}
-
-
-REST_AUTH = {
-    'USE_JWT': True,
-    'TOKEN_MODEL': None,
-    "SESSION_LOGIN": False,
-    # Never expose the (unusable) password hash in /user/.
-    'USER_SERIALIZER': 'core.api.auth_serializers.UserSerializer',
-    # ------------------------------------------------------------------
-    # Refresh-token cookie (dj-rest-auth's JWT cookie support, see
-    # dj_rest_auth.jwt_auth). The refresh token is delivered as an HttpOnly
-    # cookie and stripped from JSON bodies, so it is invisible to
-    # JavaScript (an XSS payload cannot read it); the access token stays in
-    # the body for the client to keep in localStorage.
-    # 'JWT_AUTH_HTTPONLY' stays at its default (True) on purpose.
-    # ------------------------------------------------------------------
-    'JWT_AUTH_REFRESH_COOKIE': env.str("JWT_AUTH_REFRESH_COOKIE", default="refresh_token"),
-    # Only the auth endpoints ever see the cookie.
-    'JWT_AUTH_REFRESH_COOKIE_PATH': '/api/auth/',
-    # Plain-HTTP dev stays testable; production (DEBUG off) sends Secure.
-    'JWT_AUTH_SECURE': not DEBUG,
-    # SameSite baseline is Strict — set explicitly in .env (absent from
-    # .env it would resolve to Lax; the two behave identically for the
-    # extension's call, so Strict is the honest baseline). The M4
-    # SameSite probe decides whether Chrome actually sends the cookie on
-    # the extension's cross-site fetches; a None flip (the probe's
-    # option (a) only) lands here, *after* the CORS hardening above —
-    # it is never the first step.
-    'JWT_AUTH_SAMESITE': env.str("JWT_AUTH_SAMESITE", default="Lax"),
 }
 
 # ------------------------------------------------------------------
-# Passwordless, email-OTP authentication (replaces username/password)
+# Authentication — django-allauth 65 (headless API, email/password)
 #
-# Login is a one-time 6-digit code delivered by email; accounts have an
-# unusable password. Code generation/delivery reuse django-allauth
-# (adapter.generate_login_code + send_mail); the code state itself is a
-# stateless OneTimeToken row - see core.otp / core.api.auth_views.
+# Registration: email + password + first/last name (first/last via
+# core.auth.inputs.CoreSignupInput — see docs/authentication.md).
+#
+# Email verification is MANDATORY and done by a 6-digit code in the
+# verification email (allauth's built-in by-code flow; the code state
+# lives in the Django session — no custom OTP table). Until the email is
+# verified the user is never logged in, so no tokens are ever issued to
+# an unverified account.
 # ------------------------------------------------------------------
+# allauth's backend matches email/phone credentials (Django's ModelBackend
+# only matches the username field); ModelBackend stays for username logins.
+# Without the allauth backend, email logins never authenticate.
+AUTHENTICATION_BACKENDS = [
+    "django.contrib.auth.backends.ModelBackend",
+    "allauth.account.auth_backends.AuthenticationBackend",
+]
 ACCOUNT_LOGIN_METHODS = {'email'}
-ACCOUNT_SIGNUP_FIELDS = ['email*']
-ACCOUNT_EMAIL_VERIFICATION = "none"   # verified via the OTP code instead
+ACCOUNT_SIGNUP_FIELDS = ['email*', 'password1*', 'first_name*', 'last_name*']
+ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+ACCOUNT_EMAIL_VERIFICATION_BY_CODE_ENABLED = True
+# Allauth requires the two settings together (a Critical check fails
+# otherwise): by-code verification only makes sense when verification
+# is mandatory.
+ACCOUNT_EMAIL_VERIFICATION_BY_CODE_MAX_ATTEMPTS = env.int(
+    "ACCOUNT_EMAIL_VERIFICATION_BY_CODE_MAX_ATTEMPTS", default=3)
+ACCOUNT_EMAIL_VERIFICATION_BY_CODE_TIMEOUT = env.int(
+    "ACCOUNT_EMAIL_VERIFICATION_BY_CODE_TIMEOUT", default=15 * 60)  # 15 min
+# Resend quota within the timeout window (bool maps to 2; we set a number).
+ACCOUNT_EMAIL_VERIFICATION_SUPPORTS_RESEND = env.int(
+    "ACCOUNT_EMAIL_VERIFICATION_SUPPORTS_RESEND", default=3)
+# 6-digit numeric codes for all user-facing codes (email verification).
+ALLAUTH_USER_CODE_FORMAT = {"numeric": True, "length": 6, "dashed": False}
 
-# 6-digit numeric login code (see allauth generate_user_code)
-ACCOUNT_LOGIN_BY_CODE_FORMAT = {"numeric": True, "length": 6, "dashed": False}
-
-OTP_CODE_TTL_SECONDS = env.int("OTP_CODE_TTL_SECONDS", default=300)  # 5 min
-OTP_MAX_ATTEMPTS = env.int("OTP_MAX_ATTEMPTS", default=5)
-OTP_MAX_RESENDS = env.int("OTP_MAX_RESENDS", default=3)
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 
 EMAIL_HOST = env('EMAIL_HOST', default=env('EMAIL_HOST', default='localhost')) #type: ignore
@@ -229,16 +215,91 @@ EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default=env('EMAIL_HOST_PASSWOR
 
 DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default=env('DEFAULT_FROM_EMAIL', default='webmaster@localhost')) #type: ignore
 
-SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
-    # Every refresh issues a new token and blacklists the old one, so a
-    # stolen refresh token is usable at most once. Requires
-    # rest_framework_simplejwt.token_blacklist (installed above); the
-    # rotated token travels in the HttpOnly refresh cookie, not the body.
-    "ROTATE_REFRESH_TOKENS": True,
-    "BLACKLIST_AFTER_ROTATION": True,
+# ------------------------------------------------------------------
+# Headless API + allauth's built-in JWT strategy
+#
+# The API is mounted at AUTH_API_PREFIX (bookmark/urls.py) and serves
+# only the "app" client (token-based; the "browser" client is the
+# session-cookie world and is not needed by a token-auth SPA/extension).
+#
+# Tokens: HS256 signed with HEADLESS_JWT_PRIVATE_KEY, falling back to
+# SECRET_KEY when unset (allauth's documented fallback for symmetric
+# algorithms) — the same trust model the old Simple JWT setup had.
+# ------------------------------------------------------------------
+AUTH_API_PREFIX = "/api/auth/"
+HEADLESS_CLIENTS = ("app",)
+# User payloads (session endpoint etc.) include first/last name — the
+# stock adapter omits them (see core.auth.adapter).
+HEADLESS_ADAPTER = "core.auth.adapter.CoreHeadlessAdapter"
+HEADLESS_TOKEN_STRATEGY = (
+    "allauth.headless.tokens.strategies.jwt.JWTTokenStrategy")
+HEADLESS_JWT_ALGORITHM = env.str("HEADLESS_JWT_ALGORITHM", default="HS256")
+# Never commit a real key to the repo; leave unset to sign with SECRET_KEY.
+HEADLESS_JWT_PRIVATE_KEY = env.str("HEADLESS_JWT_PRIVATE_KEY", default="")
+HEADLESS_JWT_ACCESS_TOKEN_EXPIRES_IN = env.int(
+    "HEADLESS_JWT_ACCESS_TOKEN_EXPIRES_IN", default=15 * 60)  # 15 min
+HEADLESS_JWT_REFRESH_TOKEN_EXPIRES_IN = env.int(
+    "HEADLESS_JWT_REFRESH_TOKEN_EXPIRES_IN", default=7 * 24 * 3600)  # 7 d
+# Validate access tokens against their session: logout (or the session
+# expiring) invalidates outstanding access tokens immediately, instead
+# of them living out their (15 min) lifetime. Cost: one session lookup
+# per authenticated request.
+HEADLESS_JWT_STATEFUL_VALIDATION_ENABLED = env.bool(
+    "HEADLESS_JWT_STATEFUL_VALIDATION_ENABLED", default=True)
+# Every refresh rotates the refresh token and invalidates the old one
+# (allauth default; kept explicit).
+HEADLESS_JWT_ROTATE_REFRESH_TOKEN = True
+# The frontend origin, for the links in allauth's transactional emails
+# (password reset, the "account exists" enumeration mail, ...).
+#
+# Every urlname allauth may link must have an entry: with HEADLESS_ONLY
+# an entryless lookup raises ImproperlyConfigured (500) mid-flow. The
+# relative-path fallback (FRONTEND_URL empty — dev/tests) is resolved
+# against the request origin by allauth; set FRONTEND_URL in deployment
+# to point the links at the real frontend.
+FRONTEND_URL = env.str("FRONTEND_URL", default="")
+HEADLESS_FRONTEND_URLS = {
+    "account_confirm_email": f"{FRONTEND_URL}/account/verify-email",
+    "account_reset_password": f"{FRONTEND_URL}/account/password/reset",
+    "account_reset_password_from_key": (
+        f"{FRONTEND_URL}/account/password/reset"),
+    "account_signup": f"{FRONTEND_URL}/account/signup",
+    "socialaccount_login_error": f"{FRONTEND_URL}/account",
 }
+# Pure API deployment: no headed (template-rendering) allauth views.
+# 65.21.0 setting name has no ALLAUTH_ prefix. Without it, internal
+# redirects to headed views that do not exist in this URLconf would
+# raise (unhandled NoReverseMatch) mid-flow; with it, allauth returns
+# a controlled error response instead. Link-based emails (password
+# reset) raise a clear ImproperlyConfigured unless
+# HEADLESS_FRONTEND_URLS covers them — code-based emails need no URLs.
+HEADLESS_ONLY = True
+
+# ------------------------------------------------------------------
+# Refresh-token cookie (the one thing allauth does not do on its own)
+#
+# allauth returns the refresh token in the JSON meta (a native-app
+# contract). core.auth.middleware moves it into this cookie on the way
+# out and drops it from the body; core.auth.views.RefreshTokenView
+# accepts it from the cookie on the way in. HttpOnly is a fixed
+# invariant; everything else is env-tunable.
+# ------------------------------------------------------------------
+AUTH_REFRESH_COOKIE_NAME = env.str("AUTH_REFRESH_COOKIE_NAME", default="refresh_token")
+# Only the refresh endpoint ever needs the cookie; scope it there.
+AUTH_REFRESH_COOKIE_PATH = env.str(
+    "AUTH_REFRESH_COOKIE_PATH", default="/api/auth/app/v1/tokens/")
+# Host-only cookie (no domain) unless a deployment needs to share it.
+AUTH_REFRESH_COOKIE_DOMAIN = env.str("AUTH_REFRESH_COOKIE_DOMAIN", default="")
+# Plain-HTTP dev stays testable; production (DEBUG off) sends Secure.
+# (Secure is also a hard requirement if SameSite is ever set to None.)
+AUTH_REFRESH_COOKIE_SECURE = env.bool(
+    "AUTH_REFRESH_COOKIE_SECURE", default=not DEBUG)
+# SameSite baseline is Lax. The extension's cross-origin derive call
+# needs None for Chrome to ship the cookie cross-site — set that in .env
+# only after the CORS allowlist is tightened (the B0/M4 order from the
+# rework plan: never flip before the hardening).
+AUTH_REFRESH_COOKIE_SAMESITE = env.str(
+    "AUTH_REFRESH_COOKIE_SAMESITE", default="Lax")
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',

@@ -26,8 +26,7 @@ from django.utils import timezone
 from google.genai import errors
 from rest_framework.test import APITestCase
 
-from core import otp, storage as media_storage
-from core.api import auth_views
+from core import storage as media_storage
 from core.api.serializers import CaptureSerializer
 from core.api.gemini import EMBED_DIMENSIONS, GeminiProvider, is_window_overflow
 from core.embedding_builder import (
@@ -39,7 +38,6 @@ from core.models import (
     Capture,
     CaptureContext,
     CaptureEmbedding,
-    OneTimeToken,
     ProviderRateSlot,
 )
 from core.pipeline import (
@@ -1495,326 +1493,441 @@ class CaptureMetadataMergeApiTests(APITestCase):
 
 
 # ---------------------------------------------------------------------------
-# Passwordless email-OTP authentication
+# Authentication — django-allauth 65 (headless app client + built-in JWT)
+#
+# Replaces the old dj-rest-auth + Simple JWT + custom OneTimeToken system.
+# These tests exercise the allauth headless *app* client contract as
+# mounted under settings.AUTH_API_PREFIX (see docs/authentication.md for
+# the full endpoint reference):
+#
+# * signup/login/verify are multi-stage flows resumed via the
+#   ``X-Session-Token`` header (the value allauth returns in ``meta``);
+# * once fully authenticated, allauth issues a signed JWT access token
+#   (``HEADLESS_TOKEN_STRATEGY`` = the built-in JWT strategy, HS256
+#   with the SECRET_KEY fallback) plus a refresh token;
+# * core.auth.middleware moves the refresh token out of the JSON body
+#   into an HttpOnly cookie (and back in for the refresh endpoint).
+#
+# allauth's headless responses are plain Django JsonResponse, not DRF
+# responses: there is no ``.data`` attribute — parse ``response.content``.
 # ---------------------------------------------------------------------------
+
+import jwt as pyjwt
+
+APP = f"{django_settings.AUTH_API_PREFIX}app/v1"
+SIGNUP = f"{APP}/auth/signup"
+LOGIN = f"{APP}/auth/login"
+VERIFY = f"{APP}/auth/email/verify"
+RESEND = f"{APP}/auth/email/verify/resend"
+SESSION_URL = f"{APP}/auth/session"
+REFRESH = f"{APP}/tokens/refresh"
+CONFIG_URL = f"{APP}/config"
+REFRESH_COOKIE = django_settings.AUTH_REFRESH_COOKIE_NAME
+
+
+def _body(response):
+    """Parse an allauth response body (plain JsonResponse, no .data)."""
+    try:
+        return json.loads(response.content.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _code_from_last_mail():
+    """The 6-digit verification code from the most recent email, if any."""
+    if not mail.outbox:
+        return None
+    codes = re.findall(r"\b(\d{6})\b", mail.outbox[-1].body)
+    return codes[-1] if codes else None
 
 
 def _wrong_code(code: str) -> str:
-    return "9" * 6 if code != "9" * 6 else "8" * 6
+    return "999999" if code != "999999" else "888888"
 
 
-class OneTimeTokenServiceTests(TestCase):
-    """core.otp service: hashing, single-use, expiry, attempts, resends."""
+@override_settings(
+    # allauth's cache-backed rate limits would otherwise leak between
+    # tests; these target the by-code attempt/expiry semantics instead.
+    ACCOUNT_RATE_LIMITS=False,
+    # Pin the refresh-cookie attributes: settings default them off
+    # DEBUG/.env, which varies between checkouts.
+    AUTH_REFRESH_COOKIE_NAME="refresh_token",
+    AUTH_REFRESH_COOKIE_PATH=f"{django_settings.AUTH_API_PREFIX}app/v1/tokens/",
+    AUTH_REFRESH_COOKIE_DOMAIN="",
+    AUTH_REFRESH_COOKIE_SECURE=True,
+    AUTH_REFRESH_COOKIE_SAMESITE="Lax",
+)
+class AllauthAuthBase(APITestCase):
+    PASSWORD = "s3c-ret-pass-1"
 
-    def setUp(self):
-        self.user = get_user_model().objects.create_user(
-            "u", "u@example.com", "pw"
-        )
-        EmailAddress.objects.create(
-            user=self.user, email="u@example.com", primary=True, verified=False
-        )
+    def signup(self, email="ada@example.com", **extra):
+        payload = {"email": email, "password": self.PASSWORD,
+                   "first_name": "Ada", "last_name": "Lovelace"}
+        payload.update(extra)
+        return self.client.post(SIGNUP, payload, format="json")
 
-    def _issue_capturing_code(self):
-        sent = {}
-
-        def fake_send(user, code):
-            sent["code"] = code
-
-        with patch.object(otp, "_send_code_email", side_effect=fake_send):
-            token = otp.issue_code(user=self.user)
-        return token, sent["code"]
-
-    def test_code_stored_only_as_salted_hash(self):
-        token, code = self._issue_capturing_code()
-        self.assertEqual(len(token.code_hash), 64)  # sha256 hex digest
-        self.assertEqual(len(token.salt), 32)
-        self.assertNotEqual(token.code_hash, code)
-
-    def test_issue_retires_previous_live_tokens(self):
-        self._issue_capturing_code()
-        self._issue_capturing_code()
-        self.assertEqual(
-            OneTimeToken.objects.filter(user=self.user).count(), 2
-        )
-        self.assertEqual(
-            OneTimeToken.objects.filter(
-                user=self.user, consumed_at__isnull=True
-            ).count(),
-            1,
-        )
-
-    def test_verify_is_single_use(self):
-        _, code = self._issue_capturing_code()
-        self.assertTrue(otp.verify_code(user=self.user, code=code))
-        self.assertFalse(otp.verify_code(user=self.user, code=code))  # consumed
-
-    def test_wrong_codes_exhaust_attempts_and_lock_out(self):
-        _, code = self._issue_capturing_code()
-        for _ in range(otp.MAX_ATTEMPTS):
-            self.assertFalse(
-                otp.verify_code(user=self.user, code=_wrong_code(code))
-            )
-        # The live token is now invalidated: even the right code fails.
-        self.assertFalse(otp.verify_code(user=self.user, code=code))
-        # A fresh code works again.
-        _, new_code = self._issue_capturing_code()
-        self.assertTrue(otp.verify_code(user=self.user, code=new_code))
-
-    def test_expired_code_is_rejected_and_invalidated(self):
-        token, code = self._issue_capturing_code()
-        OneTimeToken.objects.filter(pk=token.pk).update(
-            expires_at=timezone.now() - timedelta(minutes=1)
-        )
-        self.assertFalse(otp.verify_code(user=self.user, code=code))
-        token.refresh_from_db()
-        self.assertIsNotNone(token.consumed_at)
-
-    def test_resend_quota(self):
-        for _ in range(otp.MAX_RESENDS):
-            self._issue_capturing_code()
-        self.assertFalse(otp.can_resend(user=self.user))
-
-
-class OtpApiTests(APITestCase):
-    REG = "/api/auth/registration/"
-    REQ = "/api/auth/login/request/"
-    CONFIRM = "/api/auth/login/confirm/"
-
-    def setUp(self):
-        # DRF freezes SimpleRateThrottle.THROTTLE_RATES at import time, so
-        # override_settings cannot raise the limits; bypass the throttle
-        # outright (the quota logic under test lives in core.otp, not in
-        # the throttle).
-        self._throttle_patches = [
-            patch.object(auth_views._OtpThrottle, "allow_request", return_value=True),
-            patch.object(
-                auth_views._OtpConfirmThrottle, "allow_request", return_value=True
-            ),
-        ]
-        for p in self._throttle_patches:
-            p.start()
-        self.addCleanup(self._stop_throttle_patches)
-
-    def _stop_throttle_patches(self):
-        for p in reversed(self._throttle_patches):
-            p.stop()
-
-    def _code_from_outbox(self) -> str:
-        self.assertEqual(len(mail.outbox), 1)
-        match = re.search(r"\b(\d{6})\b", mail.outbox[0].body)
-        self.assertIsNotNone(match, f"no 6-digit code in: {mail.outbox[0].body!r}")
-        return match.group(1)
-
-    def _make_user(self, email="u@example.com"):
-        user = get_user_model().objects.create_user("u", email, "pw")
-        EmailAddress.objects.create(
-            user=user, email=email, primary=True, verified=True
-        )
-        return user
-
-    def test_register_confirm_full_flow_issues_working_jwt(self):
-        response = self.client.post(
-            self.REG, {"email": "new@example.com"}, format="json"
-        )
-        self.assertEqual(response.status_code, 202)
-        code = self._code_from_outbox()
-        self.assertIn("new@example.com", mail.outbox[0].to[0])
-
-        response = self.client.post(
-            self.CONFIRM,
-            {"email": "new@example.com", "code": code},
-            format="json",
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("access", response.data)
-        # The refresh token is delivered as an HttpOnly cookie, not in the body.
-        self.assertNotIn("refresh", response.data)
-        self.assertIn("refresh_token", response.cookies)
-        self.assertEqual(response.data["user"]["email"], "new@example.com")
-        self.assertNotIn("password", response.data["user"])
-
-        user = get_user_model().objects.get(email="new@example.com")
-        self.assertFalse(user.has_usable_password())
-        self.assertTrue(user.is_active)
-        self.assertTrue(EmailAddress.objects.get(user=user).verified)
-
-        # The minted JWT works on a protected endpoint.
+    def resume(self, response):
+        """Send the response's session_token as X-Session-Token."""
+        meta = (_body(response) or {}).get("meta") or {}
         self.client.credentials(
-            HTTP_AUTHORIZATION=f"Bearer {response.data['access']}"
-        )
+            HTTP_X_SESSION_TOKEN=meta.get("session_token") or "")
+        return meta
+
+    def verify(self, key):
+        return self.client.post(VERIFY, {"key": key}, format="json")
+
+    def login(self, email, password=PASSWORD):
+        return self.client.post(
+            LOGIN, {"email": email, "password": password}, format="json")
+
+    def bearer(self, access_token):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+
+    def verified_user(self, email="ada@example.com"):
+        """signup + verify through to full authentication.
+
+        Returns (user, meta) from the 200 verify response. The refresh
+        token is in the client's cookie jar by the time this returns.
+        """
+        mail.outbox = []
+        r = self.signup(email)
+        self.assertEqual(r.status_code, 401)
+        self.resume(r)
+        code = _code_from_last_mail()
+        self.assertIsNotNone(code)
+        r = self.verify(code)
+        self.assertEqual(r.status_code, 200)
+        meta = (_body(r) or {}).get("meta") or {}
+        return get_user_model().objects.get(email__iexact=email), meta
+
+
+class SignupTests(AllauthAuthBase):
+    def test_signup_creates_unverified_user_and_pending_flow(self):
+        mail.outbox = []
+        response = self.signup()
+        # Signup completes but email verification is mandatory, so the
+        # user is not yet authenticated: 401 + the pending flow.
+        self.assertEqual(response.status_code, 401)
+        body = _body(response)
+        self.assertEqual(
+            [(f["id"], f.get("is_pending")) for f in body["data"]["flows"]],
+            [("login", None), ("signup", None),
+             ("verify_email", True)])
+        self.assertFalse(body["meta"]["is_authenticated"])
+        self.assertTrue(body["meta"]["session_token"])
+        # One email, carrying the 6-digit code; no tokens, no cookies.
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIsNotNone(_code_from_last_mail())
+        self.assertNotIn("access_token", body["meta"])
+        self.assertNotIn("refresh_token", json.dumps(body))
+        self.assertFalse(response.cookies)
+
+    def test_signup_persists_user_fields(self):
+        self.signup("grace@example.com",
+                    first_name="Grace", last_name="Hopper")
+        user = get_user_model().objects.get(
+            email__iexact="grace@example.com")
+        self.assertEqual(user.first_name, "Grace")
+        self.assertEqual(user.last_name, "Hopper")
+        self.assertTrue(user.has_usable_password())
+        email = EmailAddress.objects.get(email__iexact="grace@example.com")
+        self.assertFalse(email.verified)
+        self.assertTrue(email.primary)
+
+    def test_duplicate_signup_keeps_flow_but_sends_no_code(self):
+        mail.outbox = []
+        first = self.signup()
+        self.assertEqual(first.status_code, 401)
+        code = _code_from_last_mail()
+        self.resume(first)
+        second = self.signup()
+        self.assertEqual(second.status_code, 401)
+        body = _body(second)
+        # The session is unchanged (the client already has its token),
+        # and the enumeration mail carries no code.
+        self.assertNotIn("session_token", body["meta"])
+        self.assertEqual(len(mail.outbox), 2)
+        self.assertIsNone(_code_from_last_mail())
+        # allauth's duplicate path re-issues the pending code without
+        # emailing it, so the original (emailed) code is now invalid.
+        self.assertEqual(self.verify(code).status_code, 400)
+
+    def test_signup_while_authenticated_is_conflict(self):
+        _, meta = self.verified_user()
+        self.bearer(meta["access_token"])
+        r = self.signup("other@example.com")
+        self.assertEqual(r.status_code, 409)
+
+
+class EmailVerificationTests(AllauthAuthBase):
+    def test_verify_completes_login_and_issues_tokens(self):
+        mail.outbox = []
+        first = self.signup()
+        session_token = self.resume(first)
+        self.assertIn("session_token", session_token)
+        response = self.verify(_code_from_last_mail())
+        self.assertEqual(response.status_code, 200)
+        body = _body(response)
+        self.assertTrue(body["meta"]["is_authenticated"])
+        # Login cycles the session key: the resumed token is dead, the
+        # response carries the live one.
+        self.assertNotEqual(body["meta"]["session_token"],
+                            session_token["session_token"])
+        self.assertTrue(body["meta"]["access_token"])
+        # The refresh token left the body for the HttpOnly cookie.
+        self.assertNotIn("refresh_token", json.dumps(body))
+        self.assertIn(REFRESH_COOKIE, response.cookies)
+        # The user payload carries the collected first/last names.
+        self.assertEqual(body["data"]["user"]["first_name"], "Ada")
+        self.assertEqual(body["data"]["user"]["last_name"], "Lovelace")
+        self.assertEqual(body["data"]["user"]["email"], "ada@example.com")
+        self.assertTrue(
+            EmailAddress.objects.get(email__iexact="ada@example.com")
+            .verified)
+
+    def test_wrong_code_is_400(self):
+        first = self.signup()
+        self.resume(first)
+        response = self.verify(_wrong_code(_code_from_last_mail()))
+        self.assertEqual(response.status_code, 400)
+        error = _body(response)["errors"][0]
+        self.assertEqual(error["code"], "incorrect_code")
+        self.assertEqual(error["param"], "key")
+
+    def test_attempts_exhaust_flow(self):
+        first = self.signup()
+        self.resume(first)
+        wrong = _wrong_code(_code_from_last_mail())
+        # Each wrong code is a 400; the 3rd (== MAX_ATTEMPTS) consumes
+        # the last attempt and aborts the pending flow on the way.
+        for _ in range(3):
+            self.assertEqual(self.verify(wrong).status_code, 400)
+        # The flow is now dead: further verifies and resends 409.
+        self.assertEqual(self.verify(wrong).status_code, 409)
+        self.assertEqual(
+            self.client.post(RESEND, format="json").status_code, 409)
+
+    @override_settings(ACCOUNT_EMAIL_VERIFICATION_BY_CODE_TIMEOUT=1)
+    def test_expired_code_is_conflict(self):
+        first = self.signup()
+        self.resume(first)
+        time.sleep(1.1)
+        self.assertEqual(self.verify("123456").status_code, 409)
+
+    def test_resend_rotates_code_and_resends_mail(self):
+        mail.outbox = []
+        first = self.signup()
+        self.resume(first)
+        code = _code_from_last_mail()
+        self.verify(_wrong_code(code))  # one consumed attempt
+        mail.outbox = []
+        response = self.client.post(RESEND, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        new_code = _code_from_last_mail()
+        self.assertIsNotNone(new_code)
+        self.assertNotEqual(new_code, code)
+        # The rotated-out code is dead; the new one completes login.
+        self.assertEqual(self.verify(code).status_code, 400)
+        self.assertEqual(self.verify(new_code).status_code, 200)
+
+
+class LoginTests(AllauthAuthBase):
+    def test_login_verified_issues_tokens(self):
+        self.verified_user()
+        self.client.credentials()
+        mail.outbox = []
+        response = self.login("ada@example.com")
+        self.assertEqual(response.status_code, 200)
+        body = _body(response)
+        self.assertTrue(body["meta"]["is_authenticated"])
+        self.assertTrue(body["meta"]["access_token"])
+        self.assertIn(REFRESH_COOKIE, response.cookies)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_login_wrong_password_is_400(self):
+        self.verified_user()
+        self.client.credentials()  # the resumed session token is stale
+        response = self.login("ada@example.com", password="WRONG-pass-99")
+        self.assertEqual(response.status_code, 400)
+        error = _body(response)["errors"][0]
+        self.assertEqual(error["code"], "email_password_mismatch")
+        self.assertEqual(error["param"], "password")
+
+    def test_login_unknown_email_is_400_without_mail(self):
+        mail.outbox = []
+        response = self.login("ghost@example.com")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            _body(response)["errors"][0]["code"], "email_password_mismatch")
+        self.assertEqual(len(mail.outbox), 0)  # enumeration prevention
+
+    def test_login_unverified_offers_verification_and_self_heals(self):
+        self.signup()  # leaves the user unverified
+        self.client.credentials()  # the login starts a fresh session
+        mail.outbox = []
+        response = self.login("ada@example.com")
+        self.assertEqual(response.status_code, 401)
+        body = _body(response)
+        flows = {f["id"]: f for f in body["data"]["flows"]}
+        self.assertTrue(flows["verify_email"]["is_pending"])
+        self.assertIn("session_token", body["meta"])
+        self.assertNotIn("access_token", body["meta"])
+        code = _code_from_last_mail()  # a fresh code was emailed
+        self.assertIsNotNone(code)
+        # Completing it logs the user in.
+        self.resume(response)
+        self.assertEqual(self.verify(code).status_code, 200)
+
+    def test_stale_session_token_is_410(self):
+        self.signup()
+        self.client.credentials(HTTP_X_SESSION_TOKEN="not-a-real-session")
+        self.assertEqual(self.login("ada@example.com").status_code, 410)
+
+
+class AccessTokenTests(AllauthAuthBase):
+    def test_valid_token_authenticates_allauth_and_drf(self):
+        user, meta = self.verified_user()
+        self.bearer(meta["access_token"])
+        response = self.client.get(SESSION_URL)
+        self.assertEqual(response.status_code, 200)
+        body = _body(response)
+        self.assertTrue(body["meta"]["is_authenticated"])
+        self.assertEqual(body["data"]["user"]["id"], user.id)
+        # The DRF side: allauth's JWTTokenAuthentication resolves the
+        # same token for the rest of the API.
         self.assertEqual(self.client.get("/captures/").status_code, 200)
 
-    def test_register_duplicate_is_409_and_sends_no_mail(self):
-        self._make_user("dup@example.com")
-        response = self.client.post(
-            self.REG, {"email": "dup@example.com"}, format="json"
-        )
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(len(mail.outbox), 0)
+    def test_garbage_token_is_401(self):
+        self.verified_user()
+        self.bearer("garbage.token.here")
+        self.assertEqual(self.client.get(SESSION_URL).status_code, 401)
+        self.assertEqual(self.client.get("/captures/").status_code, 401)
 
-    def test_request_unknown_email_is_200_but_sends_nothing(self):
+    def test_expired_token_is_401(self):
+        _, meta = self.verified_user()
+        access_token = meta["access_token"]
+        header, payload_b64, _signature = access_token.split(".")
+        payload = json.loads(base64.urlsafe_b64decode(
+            payload_b64 + "=" * (-len(payload_b64) % 4)))
+        payload["exp"] = payload["iat"] - 60
+        # Re-sign with the same key allauth uses for HS256 (SECRET_KEY
+        # fallback): valid signature, past expiry.
+        forged = pyjwt.encode(payload, django_settings.SECRET_KEY,
+                              algorithm="HS256")
+        if isinstance(forged, bytes):  # PyJWT < 2
+            forged = forged.decode("ascii")
+        self.bearer(forged)
+        self.assertEqual(self.client.get(SESSION_URL).status_code, 401)
+
+
+class RefreshTokenTests(AllauthAuthBase):
+    def _authenticated(self):
+        user, meta = self.verified_user()
+        self.client.credentials()  # drop headers; the cookie stays
+        self.assertTrue(self.client.cookies.get(REFRESH_COOKIE).value)
+        return user, meta
+
+    def test_refresh_rotates_token_and_cookie(self):
+        self._authenticated()
+        old = self.client.cookies[REFRESH_COOKIE].value
         response = self.client.post(
-            self.REQ, {"email": "ghost@example.com"}, format="json"
-        )
+            REFRESH, {"refresh_token": old}, format="json")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(mail.outbox), 0)
+        data = _body(response)["data"]
+        self.assertIn("access_token", data)
+        # The rotated refresh token left the body for the cookie.
+        self.assertNotIn("refresh_token", data)
+        new = response.cookies[REFRESH_COOKIE].value
+        self.assertNotEqual(new, old)
+        # The freshly minted access token works.
+        self.bearer(data["access_token"])
+        self.assertEqual(self.client.get(SESSION_URL).status_code, 200)
 
-    def test_login_request_then_confirm(self):
-        self._make_user()
+    def test_refresh_cookie_attributes(self):
+        self._authenticated()
+        old = self.client.cookies[REFRESH_COOKIE].value
         response = self.client.post(
-            self.REQ, {"email": "u@example.com"}, format="json"
-        )
+            REFRESH, {"refresh_token": old}, format="json")
+        cookie = response.cookies[REFRESH_COOKIE]
+        self.assertEqual(cookie["path"],
+                         django_settings.AUTH_REFRESH_COOKIE_PATH)
+        self.assertTrue(cookie["httponly"])
+        self.assertTrue(cookie["secure"])
+        self.assertEqual(cookie["samesite"], "Lax")
+
+    def test_refresh_falls_back_to_cookie(self):
+        # A browser cannot read its own HttpOnly cookie to put in the
+        # body; the endpoint accepts an empty body and the cookie.
+        self._authenticated()
+        response = self.client.post(REFRESH, {}, format="json")
         self.assertEqual(response.status_code, 200)
-        code = self._code_from_outbox()
+        data = _body(response)["data"]
+        self.assertIn("access_token", data)
+        self.assertNotIn("refresh_token", data)
+        self.assertTrue(response.cookies[REFRESH_COOKIE].value)
 
-        response = self.client.post(
-            self.CONFIRM, {"email": "u@example.com", "code": code}, format="json"
-        )
+    def test_stale_and_garbage_refresh_are_400(self):
+        self._authenticated()
+        old = self.client.cookies[REFRESH_COOKIE].value
+        self.client.post(REFRESH, {"refresh_token": old}, format="json")
+        # Rotation invalidated the old token.
+        self.assertEqual(
+            self.client.post(
+                REFRESH, {"refresh_token": old}, format="json")
+            .status_code, 400)
+        self.client.cookies.clear()
+        self.assertEqual(
+            self.client.post(
+                REFRESH, {"refresh_token": "garbage"}, format="json")
+            .status_code, 400)
+        self.assertEqual(
+            self.client.post(REFRESH, {}, format="json").status_code, 400)
+
+    def test_refresh_after_logout_is_400(self):
+        _, meta = self.verified_user()
+        self.client.credentials()
+        refresh_token = self.client.cookies[REFRESH_COOKIE].value
+        self.bearer(meta["access_token"])
+        self.assertEqual(self.client.delete(SESSION_URL).status_code, 401)
+        self.assertEqual(
+            self.client.post(
+                REFRESH, {"refresh_token": refresh_token}, format="json")
+            .status_code, 400)  # the session behind it is gone
+
+
+class LogoutTests(AllauthAuthBase):
+    def test_logout_kills_tokens_and_cookie(self):
+        _, meta = self.verified_user()
+        self.bearer(meta["access_token"])
+        refresh_before = self.client.cookies[REFRESH_COOKIE].value
+        response = self.client.delete(SESSION_URL)
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(_body(response)["meta"]["is_authenticated"])
+        cookie = response.cookies[REFRESH_COOKIE]
+        self.assertEqual(cookie.value, "")
+        self.assertEqual(int(cookie["max-age"]), 0)
+        self.assertEqual(cookie["path"],
+                         django_settings.AUTH_REFRESH_COOKIE_PATH)
+        # Stateful validation: the access token dies immediately.
+        self.assertEqual(self.client.get(SESSION_URL).status_code, 401)
+        # ... and the refresh token no longer refreshes.
+        self.client.cookies[REFRESH_COOKIE] = refresh_before
+        self.assertEqual(
+            self.client.post(
+                REFRESH, {"refresh_token": refresh_before}, format="json")
+            .status_code, 400)
+
+
+class ConfigTests(AllauthAuthBase):
+    def test_config(self):
+        response = self.client.get(CONFIG_URL)
         self.assertEqual(response.status_code, 200)
-        self.assertIn("access", response.data)
-
-        # The code is single-use: replaying it fails.
-        response = self.client.post(
-            self.CONFIRM, {"email": "u@example.com", "code": code}, format="json"
-        )
-        self.assertEqual(response.status_code, 400)
-
-    def test_confirm_rejects_wrong_and_unknown_codes_genericly(self):
-        self._make_user()
-        self.client.post(self.REQ, {"email": "u@example.com"}, format="json")
-        code = self._code_from_outbox()
-
-        wrong = self.client.post(
-            self.CONFIRM,
-            {"email": "u@example.com", "code": _wrong_code(code)},
-            format="json",
-        )
-        self.assertEqual(wrong.status_code, 400)
-        ghost = self.client.post(
-            self.CONFIRM, {"email": "ghost@example.com", "code": code},
-            format="json",
-        )
-        self.assertEqual(ghost.status_code, 400)
-        self.assertEqual(wrong.data["detail"], ghost.data["detail"])  # same message
-
-    def test_resend_respects_quota(self):
-        self._make_user()
-        for _ in range(otp.MAX_RESENDS):
-            response = self.client.post(
-                self.REQ, {"email": "u@example.com"}, format="json"
-            )
-            self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(mail.outbox), otp.MAX_RESENDS)
-
-        # Quota exhausted: still 200, but no additional mail.
-        response = self.client.post(
-            self.REQ, {"email": "u@example.com"}, format="json"
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(mail.outbox), otp.MAX_RESENDS)
-
-    def test_user_endpoint_never_exposes_password(self):
-        self._make_user()
-        self.client.post(self.REQ, {"email": "u@example.com"}, format="json")
-        code = self._code_from_outbox()
-        response = self.client.post(
-            self.CONFIRM, {"email": "u@example.com", "code": code}, format="json"
-        )
-        access = response.data["access"]
-
-        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
-        response = self.client.get("/api/auth/user/")
-        self.assertEqual(response.status_code, 200)
-        self.assertNotIn("password", response.data)
-
-
-class TokenRotationTests(APITestCase):
-    """Refresh-token lifecycle: cookie delivery, rotation, one-time use,
-    blacklist, logout. The refresh token lives in the HttpOnly cookie named
-    by REST_AUTH['JWT_AUTH_REFRESH_COOKIE']; the Django test client persists
-    it in its cookie jar across requests."""
-
-    CONFIRM = "/api/auth/login/confirm/"
-    REFRESH = "/api/auth/token/refresh/"
-    LOGOUT = "/api/auth/logout/"
-    REFRESH_COOKIE = "refresh_token"
-
-    def setUp(self):
-        self._throttle_patches = [
-            patch.object(auth_views._OtpThrottle, "allow_request", return_value=True),
-            patch.object(
-                auth_views._OtpConfirmThrottle, "allow_request", return_value=True
-            ),
-        ]
-        for p in self._throttle_patches:
-            p.start()
-        self.addCleanup(self._stop_throttle_patches)
-
-    def _stop_throttle_patches(self):
-        for p in reversed(self._throttle_patches):
-            p.stop()
-
-    def _log_in(self, email="u@example.com"):
-        """Create a user, issue a code in-process, confirm it via the API."""
-        user = get_user_model().objects.create_user("u", email, "pw")
-        EmailAddress.objects.create(
-            user=user, email=email, primary=True, verified=True
-        )
-        sent = {}
-        with patch.object(
-            otp, "_send_code_email", side_effect=lambda u, c: sent.update(code=c)
-        ):
-            otp.issue_code(user=user)
-        response = self.client.post(
-            self.CONFIRM, {"email": email, "code": sent["code"]}, format="json"
-        )
-        self.assertEqual(response.status_code, 200)
-        return response
-
-    def test_confirm_sets_refresh_cookie_and_strips_it_from_body(self):
-        response = self._log_in()
-        self.assertNotIn("refresh", response.data)
-        self.assertIn(self.REFRESH_COOKIE, response.cookies)
-        self.assertTrue(response.cookies[self.REFRESH_COOKIE].value)
-
-    def test_refresh_rotates_and_old_token_is_blacklisted(self):
-        response = self._log_in()
-        old = response.cookies[self.REFRESH_COOKIE].value
-
-        # The cookie jar holds the refresh token; refresh works and rotates.
-        r = self.client.post(self.REFRESH)
-        self.assertEqual(r.status_code, 200)
-        self.assertIn("access", r.data)
-        self.assertNotIn("refresh", r.data)
-        rotated = r.cookies[self.REFRESH_COOKIE].value
-        self.assertNotEqual(rotated, old)
-
-        # The rotated (new) token works ...
-        self.client.cookies[self.REFRESH_COOKIE] = rotated
-        self.assertEqual(self.client.post(self.REFRESH).status_code, 200)
-
-        # ... but the original is blacklisted: each token is single-use.
-        self.client.cookies[self.REFRESH_COOKIE] = old
-        self.assertEqual(self.client.post(self.REFRESH).status_code, 401)
-
-    def test_refresh_without_any_token_is_401(self):
-        self._log_in()
-        del self.client.cookies[self.REFRESH_COOKIE]
-        self.assertEqual(self.client.post(self.REFRESH).status_code, 401)
-
-    def test_logout_blacklists_refresh_and_clears_cookie(self):
-        response = self._log_in()
-        original = response.cookies[self.REFRESH_COOKIE].value
-
-        r = self.client.post(self.LOGOUT)
-        self.assertEqual(r.status_code, 200)
-        # The Set-Cookie expiry emptied it (the test client keeps the key
-        # with an empty value, mirroring a browser dropping the cookie).
-        self.assertEqual(self.client.cookies[self.REFRESH_COOKIE].value, "")
-
-        # And the token itself no longer refreshes.
-        self.client.cookies[self.REFRESH_COOKIE] = original
-        self.assertEqual(self.client.post(self.REFRESH).status_code, 401)
+        data = _body(response)["data"]
+        self.assertEqual(data["account"]["login_methods"], ["email"])
+        self.assertTrue(data["account"]["is_open_for_signup"])
+        self.assertTrue(data["account"]["email_verification_by_code_enabled"])
+        self.assertEqual(data["socialaccount"]["providers"], [])
 
 
 class FakeSearchProvider:

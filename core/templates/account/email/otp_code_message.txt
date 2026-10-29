@@ -1,6 +1,0 @@
-{% load i18n %}{% autoescape off %}{% trans "Here is your one-time code for" %} {{ email }}:
-
-    {{ code }}
-
-{% trans "It expires in" %} {{ minutes }} {% trans "minutes and can only be used once. If you did not request this code, you can safely ignore this email." %}
-{% endautoescape %}

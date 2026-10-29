@@ -11,16 +11,13 @@ cryptography==50.0.2
 ctranslate2==4.8.0
 defusedxml==0.7.1
 distro==1.9.0
-dj-rest-auth==7.2.0
 Django==5.2.14
-django-allauth==65.19.4
+django-allauth==65.21.0
 django-cors-headers==4.9.0
 django-environ==0.13.0
 django-picklefield==3.4.0
 django-q2==1.11.1
-django-rest-auth==0.9.5
 djangorestframework==3.18.1
-djangorestframework_simplejwt==5.5.1
 faster-whisper==1.2.1
 filelock==3.29.0
 flatbuffers==25.12.19
