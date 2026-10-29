@@ -9,8 +9,11 @@ nothing else in the user table changed).
 Allauth's *headless* API is used in **app-client** mode
 (`HEADLESS_CLIENTS = ("app",)`): JSON in, JSON out, no templates, no browser
 session cookie, no CSRF token. Both the React SPA and the extension speak this
-one contract. (The SPA uses the refresh cookie + Bearer token; the extension
-derives its access token from that same cookie via the refresh endpoint.)
+one contract — the two just carry the tokens differently (see
+[Token cookies](#token-cookies)): the SPA rides the HttpOnly cookies and never
+holds a token in JavaScript; the extension keeps the body token in its own
+storage and uses `Authorization: Bearer` (it derives the access token from the
+refresh cookie via the refresh endpoint on wake / 401).
 
 > **Version note.** docs.allauth.org serves two lines: *latest* (the 65.x
 > releases — what we run) and *dev* (unreleased 66.x). All setting names and
@@ -128,9 +131,11 @@ While an authenticated Bearer token is presented, signup → `409`.
 }
 ```
 
-plus a `Set-Cookie: refresh_token=…` (see [Refresh token cookie](#refresh-token-cookie)).
-The refresh token that allauth emitted in `meta` is **removed from the body**
-by `core.auth.middleware`. The email address is now marked verified
+plus `Set-Cookie` headers for **both** token cookies (see
+[Token cookies](#token-cookies)). The refresh token that allauth emitted in
+`meta` is **removed from the body** by `core.auth.middleware`; the
+`access_token` stays in the body **and** is mirrored into the HttpOnly
+`access_token` cookie. The email address is now marked verified
 (`EmailAddress.verified = True`), and the pending login completes — which
 cycles the Django session key, so the **old** `session_token` from signup is
 dead (`410` if reused) and the new one is the live handle.
@@ -153,7 +158,10 @@ No body. `200` and a fresh code email (old code dies; the window restarts).
 ```
 
 - Verified user → `200` with the same shape as the verify success above
-  (`meta.access_token` + refresh cookie; `data.user`, `data.methods`).
+  (`meta.access_token` + both token cookies; `data.user`, `data.methods`).
+  A client that is **already** authenticated (a live access cookie, or an
+  `Authorization` header whose session is alive) gets `409` instead — the
+  SPA checks `GET auth/session` before logging in.
 - Wrong password / unknown email → `400`
   `{"code": "email_password_mismatch", "param": "password",
     "message": "The email address and/or password you specified are not correct."}`
@@ -173,8 +181,9 @@ Unauthenticated → `401` with the available `flows` (same shape as signup).
 
 ### `DELETE /api/auth/app/v1/auth/session` (Bearer)
 
-Logout: Django session flushed, refresh cookie **cleared** (`Set-Cookie` with
-empty value, `Max-Age=0`, same path/attributes), response `401`. Because of
+Logout: Django session flushed, **both** token cookies **cleared**
+(`Set-Cookie` with empty value, `Max-Age=0`, same path/attributes), response
+`401`. Because of
 [stateful validation](#token-lifecycle), every outstanding access token for
 that session dies immediately.
 
@@ -217,9 +226,19 @@ selected via `HEADLESS_TOKEN_STRATEGY`) is **session-backed**:
   old Simple JWT setup had). Set `HEADLESS_JWT_PRIVATE_KEY` to move to an
   asymmetric key without code changes.
 
-Client flow: `login/verify` → keep `access_token` (JS-readable) + the browser
-keeps the HttpOnly refresh cookie → on 401, `POST tokens/refresh` with an
-**empty body** (the browser attaches the cookie) → new access token → retry.
+Client flow: `login/verify` → the response carries `access_token` in the body
+**and** both cookies.
+
+- **SPA** (browser): never reads or stores the body token — it rides the
+  `access_token` cookie, which the bridge turns into the `Authorization`
+  header server-side ([below](#token-cookies)). On 401 → `POST
+  tokens/refresh` with an **empty body** (the browser attaches the refresh
+  cookie, whose path matches that one endpoint) → new access cookie → retry.
+  No token management code exists in the SPA at all.
+- **Extension** (service worker): keeps the body token in `chrome.storage`
+  (JS by nature) and sends `Authorization: Bearer`; on wake/401 it derives a
+  fresh one from the refresh cookie via the same refresh endpoint, then
+  retries.
 
 ## Flow resumption (`X-Session-Token`)
 
@@ -234,16 +253,22 @@ the `X-Session-Token` header. Rules of thumb:
 - A token whose session no longer exists → `410 Gone` — the client should
   drop it and start over.
 
-## Refresh token cookie
+## Token cookies
 
-`core/auth/cookies.py` + `core/auth/middleware.py` (the one thing allauth
-doesn't do itself): the middleware moves `refresh_token` from the response
-body (`meta` on auth responses, `data` on refresh) into a cookie and removes
-it from JSON, and clears it on logout.
+`core/auth/cookies.py` + `core/auth/middleware.py` do the cookie translation
+allauth doesn't do itself, for the headless *app* client only (everything
+under `<AUTH_API_PREFIX>app/`).
+
+### Refresh token — body → cookie (*moved*)
+
+The middleware moves `refresh_token` from the response body (`meta` on auth
+responses, `data` on refresh) into a cookie and removes it from JSON, and
+clears it on logout.
 
 - `HttpOnly` is a fixed invariant (never configurable) — the refresh token
   is a long-lived credential and must never reach JavaScript.
-- `access_token` and `session_token` deliberately stay in the body.
+- `session_token` deliberately stays in the body — it is part of allauth's
+  app-client contract (multi-stage flows resume via `X-Session-Token`).
 - Attributes (all `AUTH_REFRESH_COOKIE_*` env-tunable in `bookmark/settings.py`):
 
 | Attribute | Setting | Default |
@@ -259,6 +284,74 @@ attached nowhere else. **Deployment:** `Secure` is on (DEBUG off), and the
 extension's cross-origin derive call needs `SameSite=None` — but only
 *after* the CORS allowlist is tightened (B0/M4 order: with `Secure`+`None`,
 `CORS_ALLOW_ALL_ORIGINS=True` would let any site steal the token).
+
+### Access token — body → cookie (*mirrored*; the body copy stays)
+
+When allauth mints a *new* access token (`meta` on login/verify, `data` on
+refresh), the middleware **also mirrors** it into the HttpOnly
+`access_token` cookie. The body copy **remains** — the extension (and any
+other non-browser client) reads the token from the JSON and keeps it in its
+own storage; the SPA simply ignores it, so no access token ever lives in the
+SPA's JavaScript.
+
+- `HttpOnly` is a fixed invariant, as on the refresh cookie.
+- Attributes (all `AUTH_ACCESS_COOKIE_*` env-tunable in `bookmark/settings.py`):
+
+| Attribute | Setting | Default |
+|---|---|---|
+| name | `AUTH_ACCESS_COOKIE_NAME` | `access_token` |
+| path | `AUTH_ACCESS_COOKIE_PATH` | `/api/` |
+| domain | `AUTH_ACCESS_COOKIE_DOMAIN` | (host-only) |
+| Secure | `AUTH_ACCESS_COOKIE_SECURE` | `not DEBUG` |
+| SameSite | `AUTH_ACCESS_COOKIE_SAMESITE` | `Lax` |
+| Max-Age | — (not separately tunable) | `HEADLESS_JWT_ACCESS_TOKEN_EXPIRES_IN` (900) |
+
+The path is `/api/` — every API endpoint, unlike the refresh cookie's single
+door. Max-Age reuses the access token's lifetime, so the cookie dies in step
+with the token it carries; allauth only exposes a *new* access token when one
+is actually minted (the login/verify transition, and every refresh), so the
+cookie's 15-minute clock always tracks the token's.
+
+#### Read side — the bridge
+
+A browser cannot read its own HttpOnly cookie to build an `Authorization`
+header, so `core.auth.middleware.AccessTokenBridgeMiddleware` (early in
+`MIDDLEWARE`, before `AuthenticationMiddleware`) synthesizes the header from
+the cookie **when the request carries no header**. Everything downstream —
+allauth's JWT strategy (it reads `META["HTTP_AUTHORIZATION"]`), DRF's
+`JWTTokenAuthentication`, the stateful session validation — then behaves
+exactly as if the client had sent the token explicitly.
+
+Two deliberate rules:
+
+- **A present `Authorization` header always wins — even a stale or garbage
+  one.** Not falling back to the cookie when a header is present would let a
+  client that *believes* it is authenticated (holding an expired token)
+  silently succeed in someone else's session. A stale header must 401; the
+  SPA then refreshes and the retry rides the fresh cookie.
+- **No header and no cookie → anonymous** — the normal unauthenticated path.
+
+**CSRF:** there is no CSRF-token machinery. The app-client views are
+`csrf_exempt` inside allauth, and the cookie's `Path=/api/` + `SameSite=Lax`
+keeps third-party sites from attaching it to cross-site requests — a hostile
+site can at best trigger a top-level GET whose response it cannot read (no
+CORS grant). SameSite stays `Lax` as its **final** value: the only consumer
+is the SPA, which is same-origin (WhiteNoise) and needs no CORS/`credentials`
+configuration, and the extension deliberately uses the *body* token, never
+this cookie — so, unlike the refresh cookie, it never needs the `None` flip.
+
+**SPA usage** (when the frontend is written): plain same-origin `fetch()` —
+no `credentials` option, no token plumbing. The 401 → refresh → retry wrapper
+is the *only* client code this design requires:
+
+```js
+async function api(url, opts) {
+  const res = await fetch(url, opts)            // the access cookie rides along
+  if (res.status !== 401) return res
+  await fetch(`${AUTH}/tokens/refresh`, { method: "POST" })  // empty body
+  return api(url, opts)                         // the new access cookie is in the jar
+}
+```
 
 ## Configuration (settings)
 
@@ -280,7 +373,8 @@ extension's cross-origin derive call needs `SameSite=None` — but only
 | `EMAIL_RATE_LIMITS` | `3/1m, 100/24h, 10/24h-unknown` | Per-address confirmation-mail throttling |
 | `AUTH_API_PREFIX` | `/api/auth/` | Where the headless API is mounted |
 | `REST_FRAMEWORK DEFAULT_AUTHENTICATION_CLASSES` | allauth `JWTTokenAuthentication` | The DRF side of the token contract |
-| MIDDLEWARE | + `core.auth.middleware.RefreshCookieMiddleware` | The cookie translation (after allauth's `AccountMiddleware`) |
+| MIDDLEWARE | + `core.auth.middleware.AccessTokenBridgeMiddleware` + `core.auth.middleware.RefreshCookieMiddleware` | Bridge = access cookie → `Authorization` header (before `AuthenticationMiddleware`); RefreshCookie = refresh-token body↔cookie translation, access-token mirror, and logout clearing (after allauth's `AccountMiddleware`) |
+| `AUTH_ACCESS_COOKIE_*` | see [Token cookies](#token-cookies) | The access-token cookie attributes (`Lax` is its final value — SPA-only, same-origin) |
 
 ## Migrations & requirements
 
@@ -301,7 +395,8 @@ extension's cross-origin derive call needs `SameSite=None` — but only
 | `HEADLESS_JWT_ACCESS_TOKEN_EXPIRES_IN` | `900` | seconds |
 | `HEADLESS_JWT_REFRESH_TOKEN_EXPIRES_IN` | `604800` | seconds |
 | `HEADLESS_JWT_STATEFUL_VALIDATION_ENABLED` | `True` | |
-| `AUTH_REFRESH_COOKIE_*` | see [cookie](#refresh-token-cookie) | `AUTH_REFRESH_COOKIE_SAMESITE=Strict` is set in the dev `.env` (B0/M4) |
+| `AUTH_REFRESH_COOKIE_*` | see [Token cookies](#token-cookies) | `AUTH_REFRESH_COOKIE_SAMESITE=Strict` is set in the dev `.env` (B0/M4) |
+| `AUTH_ACCESS_COOKIE_*` | see [Token cookies](#token-cookies) | `Lax` is the **final** value — the SPA is same-origin and the extension uses the body token, so this cookie never needs `None` |
 | `FRONTEND_URL` | *(empty → relative paths)* | Must be set where link-based mails are user-visible |
 
 ## Tests
@@ -309,9 +404,11 @@ extension's cross-origin derive call needs `SameSite=None` — but only
 ```
 venv/bin/python manage.py test core.tests.SignupTests core.tests.EmailVerificationTests \
   core.tests.LoginTests core.tests.AccessTokenTests core.tests.RefreshTokenTests \
-  core.tests.LogoutTests core.tests.ConfigTests --noinput
+  core.tests.AccessTokenCookieTests core.tests.LogoutTests core.tests.ConfigTests --noinput
 ```
 
 (in `core/tests.py`, replacing the old email-OTP section; fully offline —
 mail in the outbox, tokens parsed/`HS256`-re-signed locally, cookie asserts
-against the actual `Set-Cookie`.)
+against the actual `Set-Cookie`, bridge behavior exercised through the test
+client — which sends its whole cookie jar on every request, no Path
+filtering, like no real browser does.)

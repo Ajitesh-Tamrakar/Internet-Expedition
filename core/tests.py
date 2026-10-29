@@ -1523,6 +1523,7 @@ SESSION_URL = f"{APP}/auth/session"
 REFRESH = f"{APP}/tokens/refresh"
 CONFIG_URL = f"{APP}/config"
 REFRESH_COOKIE = django_settings.AUTH_REFRESH_COOKIE_NAME
+ACCESS_COOKIE = django_settings.AUTH_ACCESS_COOKIE_NAME
 
 
 def _body(response):
@@ -1549,13 +1550,18 @@ def _wrong_code(code: str) -> str:
     # allauth's cache-backed rate limits would otherwise leak between
     # tests; these target the by-code attempt/expiry semantics instead.
     ACCOUNT_RATE_LIMITS=False,
-    # Pin the refresh-cookie attributes: settings default them off
+    # Pin the token-cookie attributes: settings default them off
     # DEBUG/.env, which varies between checkouts.
     AUTH_REFRESH_COOKIE_NAME="refresh_token",
     AUTH_REFRESH_COOKIE_PATH=f"{django_settings.AUTH_API_PREFIX}app/v1/tokens/",
     AUTH_REFRESH_COOKIE_DOMAIN="",
     AUTH_REFRESH_COOKIE_SECURE=True,
     AUTH_REFRESH_COOKIE_SAMESITE="Lax",
+    AUTH_ACCESS_COOKIE_NAME="access_token",
+    AUTH_ACCESS_COOKIE_PATH="/api/",
+    AUTH_ACCESS_COOKIE_DOMAIN="",
+    AUTH_ACCESS_COOKIE_SECURE=True,
+    AUTH_ACCESS_COOKIE_SAMESITE="Lax",
 )
 class AllauthAuthBase(APITestCase):
     PASSWORD = "s3c-ret-pass-1"
@@ -1736,6 +1742,10 @@ class LoginTests(AllauthAuthBase):
     def test_login_verified_issues_tokens(self):
         self.verified_user()
         self.client.credentials()
+        # The verify above left a live access cookie in the jar; a client
+        # that still holds one is authenticated (the login would 409), so
+        # represent a fresh browser that has no tokens at all.
+        self.client.cookies.clear()
         mail.outbox = []
         response = self.login("ada@example.com")
         self.assertEqual(response.status_code, 200)
@@ -1748,6 +1758,8 @@ class LoginTests(AllauthAuthBase):
     def test_login_wrong_password_is_400(self):
         self.verified_user()
         self.client.credentials()  # the resumed session token is stale
+        # Same fresh-browser state as above: no live access cookie.
+        self.client.cookies.clear()
         response = self.login("ada@example.com", password="WRONG-pass-99")
         self.assertEqual(response.status_code, 400)
         error = _body(response)["errors"][0]
@@ -1894,6 +1906,77 @@ class RefreshTokenTests(AllauthAuthBase):
             self.client.post(
                 REFRESH, {"refresh_token": refresh_token}, format="json")
             .status_code, 400)  # the session behind it is gone
+
+
+class AccessTokenCookieTests(AllauthAuthBase):
+    def test_access_cookie_set_on_verify_and_body_kept(self):
+        mail.outbox = []
+        first = self.signup()
+        self.resume(first)
+        response = self.verify(_code_from_last_mail())
+        self.assertEqual(response.status_code, 200)
+        body = _body(response)
+        # The body copy stays (non-browser clients read it from there)...
+        self.assertIn("access_token", body["meta"])
+        # ...and the token is mirrored into the HttpOnly cookie.
+        cookie = response.cookies[ACCESS_COOKIE]
+        self.assertEqual(cookie.value, body["meta"]["access_token"])
+        self.assertEqual(cookie["path"], "/api/")
+        self.assertTrue(cookie["httponly"])
+        self.assertTrue(cookie["secure"])
+        self.assertEqual(cookie["samesite"], "Lax")
+        # The cookie dies in step with the token it carries.
+        self.assertEqual(
+            int(cookie["max-age"]),
+            django_settings.HEADLESS_JWT_ACCESS_TOKEN_EXPIRES_IN)
+
+    def test_cookie_only_request_authenticates(self):
+        self.verified_user()
+        self.client.credentials()  # drop all headers; the cookie stays
+        self.assertEqual(self.client.get(SESSION_URL).status_code, 200)
+        self.assertEqual(self.client.get("/captures/").status_code, 200)
+
+    def test_header_wins_over_cookie(self):
+        _, meta = self.verified_user()
+        self.client.credentials()
+        self.client.cookies[ACCESS_COOKIE] = "stale-cookie-value"
+        # A real header takes precedence; the stale cookie is ignored.
+        self.bearer(meta["access_token"])
+        self.assertEqual(self.client.get(SESSION_URL).status_code, 200)
+
+    def test_invalid_header_does_not_fall_back_to_cookie(self):
+        # A present (garbage) header must not be silently replaced by
+        # the cookie: the client believes it is authenticated.
+        self.verified_user()
+        self.client.credentials()
+        self.assertTrue(self.client.cookies.get(ACCESS_COOKIE).value)
+        self.bearer("garbage.header.value")
+        self.assertEqual(self.client.get(SESSION_URL).status_code, 401)
+
+    def test_refresh_rotates_access_cookie(self):
+        self.verified_user()
+        self.client.credentials()
+        old = self.client.cookies[ACCESS_COOKIE].value
+        response = self.client.post(
+            REFRESH,
+            {"refresh_token": self.client.cookies[REFRESH_COOKIE].value},
+            format="json")
+        self.assertEqual(response.status_code, 200)
+        new = response.cookies[ACCESS_COOKIE].value
+        self.assertNotEqual(new, old)
+        self.assertEqual(new, _body(response)["data"]["access_token"])
+
+    def test_logout_clears_access_cookie(self):
+        _, meta = self.verified_user()
+        self.bearer(meta["access_token"])
+        response = self.client.delete(SESSION_URL)
+        self.assertEqual(response.status_code, 401)
+        cookie = response.cookies[ACCESS_COOKIE]
+        self.assertEqual(cookie.value, "")
+        self.assertEqual(int(cookie["max-age"]), 0)
+        self.assertEqual(cookie["path"], "/api/")
+        # The cookie is gone and the session behind it is dead.
+        self.assertEqual(self.client.get(SESSION_URL).status_code, 401)
 
 
 class LogoutTests(AllauthAuthBase):

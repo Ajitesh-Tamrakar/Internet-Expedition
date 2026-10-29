@@ -1,11 +1,15 @@
-"""HttpOnly refresh-token cookie helpers.
+"""HttpOnly token-cookie helpers.
 
 The refresh token is a long-lived credential: whoever holds it can mint
 access tokens. It therefore never appears in a JSON response body or a
 request body written by JavaScript — it lives in a cookie that only the
-browser sends. ``HttpOnly`` is a fixed invariant (not configurable); the
-other attributes come from settings (see the AUTH_REFRESH_COOKIE_* block
-in ``bookmark.settings``).
+browser sends.
+
+The access token is short-lived (15 min) and *also* mirrored into a
+cookie so the SPA never holds it in JavaScript; its body copy stays for
+non-browser clients (the extension). ``HttpOnly`` is a fixed invariant on
+both; the other attributes come from the AUTH_REFRESH_COOKIE_* /
+AUTH_ACCESS_COOKIE_* blocks in ``bookmark.settings``.
 """
 from django.conf import settings
 
@@ -39,6 +43,39 @@ def clear_refresh_cookie(response) -> None:
     kwargs["max_age"] = 0
     response.set_cookie(
         settings.AUTH_REFRESH_COOKIE_NAME,
+        "",
+        expires=0,
+        **kwargs,
+    )
+
+
+def access_cookie_kwargs() -> dict:
+    """Attributes for the access-token cookie (mirror of the refresh one)."""
+    return {
+        # The cookie dies in step with the token it carries.
+        "max_age": settings.HEADLESS_JWT_ACCESS_TOKEN_EXPIRES_IN,
+        # Every API endpoint, unlike the refresh cookie's single door.
+        "path": settings.AUTH_ACCESS_COOKIE_PATH,
+        "domain": settings.AUTH_ACCESS_COOKIE_DOMAIN or None,
+        "secure": settings.AUTH_ACCESS_COOKIE_SECURE,
+        "httponly": True,
+        "samesite": settings.AUTH_ACCESS_COOKIE_SAMESITE,
+    }
+
+
+def set_access_cookie(response, token: str) -> None:
+    response.set_cookie(
+        settings.AUTH_ACCESS_COOKIE_NAME,
+        token,
+        **access_cookie_kwargs(),
+    )
+
+
+def clear_access_cookie(response) -> None:
+    kwargs = access_cookie_kwargs()
+    kwargs["max_age"] = 0
+    response.set_cookie(
+        settings.AUTH_ACCESS_COOKIE_NAME,
         "",
         expires=0,
         **kwargs,

@@ -147,6 +147,11 @@ MIDDLEWARE = [
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
+    # A browser cannot read its own HttpOnly access cookie to build the
+    # Authorization header; synthesize it when the cookie is present and
+    # no header is. A real header always wins.
+    # (see core.auth.middleware.AccessTokenBridgeMiddleware)
+    'core.auth.middleware.AccessTokenBridgeMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'allauth.account.middleware.AccountMiddleware',
     # Moves the allauth refresh token out of the JSON meta and into the
@@ -305,6 +310,33 @@ AUTH_REFRESH_COOKIE_SECURE = env.bool(
 # rework plan: never flip before the hardening).
 AUTH_REFRESH_COOKIE_SAMESITE = env.str(
     "AUTH_REFRESH_COOKIE_SAMESITE", default="Lax")
+
+# ------------------------------------------------------------------
+# Access-token cookie (browser clients ride it; the body copy stays)
+#
+# core.auth.middleware mirrors the access token from the auth responses
+# (login/verify/refresh) into this cookie — HttpOnly, so the SPA never
+# holds it in JavaScript. The token REMAINS in the JSON body too: the
+# extension and any other non-browser client read it from there.
+#
+# core.auth.middleware.AccessTokenBridgeMiddleware synthesizes the
+# Authorization header from the cookie when no header is present, so
+# allauth's JWT strategy and DRF's JWTTokenAuthentication work unchanged.
+#
+# The path is /api/ (every API endpoint, unlike the refresh cookie's
+# single endpoint). SameSite stays Lax: the SPA is same-origin (cookies
+# ride along without any CORS/credentials config), and the only
+# cross-origin client (the extension) deliberately uses the body token,
+# never this cookie — so None is never needed here.
+# ------------------------------------------------------------------
+AUTH_ACCESS_COOKIE_NAME = env.str("AUTH_ACCESS_COOKIE_NAME", default="access_token")
+AUTH_ACCESS_COOKIE_PATH = env.str("AUTH_ACCESS_COOKIE_PATH", default="/api/")
+AUTH_ACCESS_COOKIE_DOMAIN = env.str("AUTH_ACCESS_COOKIE_DOMAIN", default="")
+# Plain-HTTP dev stays testable; production (DEBUG off) sends Secure.
+AUTH_ACCESS_COOKIE_SECURE = env.bool(
+    "AUTH_ACCESS_COOKIE_SECURE", default=not DEBUG)
+AUTH_ACCESS_COOKIE_SAMESITE = env.str(
+    "AUTH_ACCESS_COOKIE_SAMESITE", default="Lax")
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
