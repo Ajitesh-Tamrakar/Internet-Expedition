@@ -7,6 +7,7 @@ import LoginPage from './pages/LoginPage'
 import ResetPasswordPage from './pages/ResetPasswordPage'
 import SearchPage from './pages/SearchPage'
 import SignupPage from './pages/SignupPage'
+import UserInfoPage from './pages/UserInfoPage'
 
 /**
  * `/` — send the user where their session says they belong. A logged-in
@@ -56,6 +57,20 @@ export default function App() {
        * HEADLESS_FRONTEND_URLS entries in bookmark/settings.py.)
        */}
       <Route path="/account/password/reset" element={<ResetPasswordPage />} />
+      {/*
+       * The user information page (section 5): the signed-in user's
+       * name/email plus sign-out and change-password. Protected — the
+       * reset route above is a sibling pattern, not a parent, so the two
+       * coexist. (The navigation that links here lands in section 7.)
+       */}
+      <Route
+        path="/account"
+        element={
+          <RequireAuth>
+            <UserInfoPage />
+          </RequireAuth>
+        }
+      />
       <Route
         path="/search"
         element={

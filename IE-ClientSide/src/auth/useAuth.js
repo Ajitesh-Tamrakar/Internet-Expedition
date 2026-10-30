@@ -2,6 +2,7 @@ import { useSyncExternalStore } from 'react'
 
 import { authStore } from './authStore'
 import {
+  changePassword,
   getAuthConfig,
   getSession,
   initSession,
@@ -25,6 +26,7 @@ const actions = Object.freeze({
   verifyEmail,
   resendVerification,
   logout,
+  changePassword,
   requestPasswordReset,
   verifyResetLink,
   resetPassword,

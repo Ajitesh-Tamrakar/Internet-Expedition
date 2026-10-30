@@ -9,6 +9,7 @@
 export { STATUS, authStore } from './authStore'
 export { useAuth } from './useAuth'
 export {
+  changePassword,
   getAuthConfig,
   getSession,
   initSession,

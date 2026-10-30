@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { authStore } from './authStore'
 import {
+  changePassword,
   getSession,
   initSession,
   login,
@@ -616,6 +617,253 @@ describe('logout()', () => {
     expect(result.ok).toBe(true)
     expect(result.status).toBe('logged_out')
     expect(authStore.getSnapshot().status).toBe('unauthenticated')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Password change (authenticated) — planning section 5
+//
+// The backend contract (verified against the installed django-allauth
+// 65.21.0, whose stock ChangePasswordView the project mounts at
+// POST account/password/change):
+//
+//   200 — the password was set. `data.user` + a fresh meta.session_token,
+//         but NO new access/refresh tokens (allauth mints none for a user
+//         who was already authenticated) — while the previous session (and
+//         therefore the old access/refresh tokens) is dead.
+//   400 — wrong current_password, or a new_password that fails one of
+//         Django's validators (per-field `errors[]` with `param`).
+//   401 — no live session. 429 — rate limited.
+//
+// changePassword() therefore auto-logs-in with the new password to
+// restore the session (the resetPassword() pattern), and normalizes the
+// store when that auto-login does not land on a live session.
+// ---------------------------------------------------------------------------
+
+describe('changePassword()', () => {
+  const CHANGE_SUCCESS_200 = () =>
+    jsonResponse(200, {
+      status: 200,
+      data: { user: USER, methods: [] },
+      meta: { is_authenticated: true, session_token: 'st-after-change' },
+    })
+  const WRONG_CURRENT_400 = () =>
+    jsonResponse(400, {
+      status: 400,
+      errors: [
+        { message: 'Please type your current password.', code: 'enter_current_password', param: 'current_password' },
+      ],
+    })
+  const WEAK_NEW_400 = () =>
+    jsonResponse(400, {
+      status: 400,
+      errors: [
+        { message: 'This password is too short. It must contain at least 8 characters.', code: 'password_too_short', param: 'new_password' },
+      ],
+    })
+  const LOGIN_SUCCESS_200 = () =>
+    jsonResponse(200, {
+      status: 200,
+      data: { user: USER, methods: [] },
+      meta: { is_authenticated: true, session_token: 'st-live', access_token: 'at-1' },
+    })
+
+  beforeEach(() => {
+    authStore.setAuthenticated(USER, null)
+  })
+
+  it('POSTs current_password + new_password as JSON to the mounted change endpoint', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.changePassword, () => CHANGE_SUCCESS_200()],
+      [AUTH_URL.login, () => LOGIN_SUCCESS_200()],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    await changePassword({ currentPassword: 'orig-pass-123', newPassword: 'brand-new-999' })
+
+    const { url, options } = callFor(calls, '/account/password/change')[0]
+    expect(url.endsWith('/account/password/change')).toBe(true)
+    expect(options.method).toBe('POST')
+    expect(JSON.parse(options.body)).toEqual({
+      current_password: 'orig-pass-123',
+      new_password: 'brand-new-999',
+    })
+  })
+
+  it('a successful change auto-logs-in (reusing the 410 retry for a stale stored token) and stays authenticated', async () => {
+    authStore.setAuthenticated(USER, 'st-stale')
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.changePassword, () => CHANGE_SUCCESS_200()],
+      // login() resumes the stored token first; that session is dead
+      // (the change flushed it) so it 410s, and the retry goes without it
+      [AUTH_URL.login, (n, options) =>
+        options.headers['X-Session-Token']
+          ? jsonResponse(410, { status: 410 })
+          : LOGIN_SUCCESS_200()],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await changePassword({ currentPassword: 'orig', newPassword: 'brand-new-999' })
+
+    expect(result.ok).toBe(true)
+    expect(result.status).toBe('authenticated')
+    expect(result.passwordChanged).toBe(true)
+    expect(authStore.getSnapshot().status).toBe('authenticated')
+    expect(authStore.getSnapshot().sessionToken).toBe('st-live')
+    // the change, then the login + its 410 retry
+    expect(callFor(calls, '/account/password/change')).toHaveLength(1)
+    const logins = callFor(calls, '/auth/login')
+    expect(logins).toHaveLength(2)
+    expect(logins[0].options.headers['X-Session-Token']).toBe('st-stale')
+    expect(logins[1].options.headers['X-Session-Token']).toBeUndefined()
+    // the auto-login uses the exact credentials the user just set
+    expect(JSON.parse(logins[0].options.body)).toEqual({
+      email: 'ada@example.com',
+      password: 'brand-new-999',
+    })
+  })
+
+  it('a change whose auto-login fails reports passwordChanged + the login failure, and normalizes the store', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.changePassword, () => CHANGE_SUCCESS_200()],
+      [AUTH_URL.login, () =>
+        jsonResponse(400, {
+          status: 400,
+          errors: [
+            { message: 'The email address and/or password you specified are not correct.', code: 'email_password_mismatch', param: 'password' },
+          ],
+        })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await changePassword({ currentPassword: 'orig', newPassword: 'brand-new-999' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('credentials_invalid')
+    expect(result.passwordChanged).toBe(true)
+    expect(callFor(calls, '/auth/login')).toHaveLength(1)
+    // the previous session is dead and no new one exists — the store must
+    // not keep believing the user is signed in
+    const snapshot = authStore.getSnapshot()
+    expect(snapshot.status).toBe('unauthenticated')
+    expect(snapshot.user).toBeNull()
+  })
+
+  it('a change whose auto-login lands on an unverified account keeps the pending-flow token', async () => {
+    const { fetchMock } = mockBackend([
+      [AUTH_URL.changePassword, () => CHANGE_SUCCESS_200()],
+      [AUTH_URL.login, () =>
+        jsonResponse(401, {
+          status: 401,
+          data: { flows: [{ id: 'login' }, { id: 'verify_email', is_pending: true }] },
+          meta: { is_authenticated: false, session_token: 'st-verify' },
+        })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await changePassword({ currentPassword: 'orig', newPassword: 'brand-new-999' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('verification_pending')
+    expect(result.passwordChanged).toBe(true)
+    const snapshot = authStore.getSnapshot()
+    expect(snapshot.status).toBe('unauthenticated')
+    expect(snapshot.sessionToken).toBe('st-verify') // the flow must survive
+  })
+
+  it('a change with no email in the user payload signs the user out and says where to go', async () => {
+    authStore.setAuthenticated({ id: 1, username: 'ada', display: 'ada' }, null) // no email
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.changePassword, () => CHANGE_SUCCESS_200()],
+      [AUTH_URL.login, () => LOGIN_SUCCESS_200()],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await changePassword({ currentPassword: 'orig', newPassword: 'brand-new-999' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('unauthenticated')
+    expect(result.passwordChanged).toBe(true)
+    expect(result.error.message).toMatch(/please sign in/i)
+    expect(callFor(calls, '/auth/login')).toHaveLength(0) // nothing to log in with
+    expect(authStore.getSnapshot().status).toBe('unauthenticated')
+  })
+
+  it('a wrong current password (400) reports validation and leaves the session alone', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.changePassword, () => WRONG_CURRENT_400()],
+      [AUTH_URL.login, () => LOGIN_SUCCESS_200()],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await changePassword({ currentPassword: 'nope', newPassword: 'brand-new-999' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('validation')
+    expect(result.passwordChanged).toBeUndefined()
+    expect(result.error.message).toBe('Please type your current password.')
+    expect(result.error.param).toBe('current_password')
+    // no auto-login (the change did not happen) and the session is alive
+    expect(callFor(calls, '/auth/login')).toHaveLength(0)
+    expect(authStore.getSnapshot().status).toBe('authenticated')
+  })
+
+  it('a rejected new password (400, password validator) reports validation on the new_password field', async () => {
+    const { fetchMock } = mockBackend([
+      [AUTH_URL.changePassword, () => WEAK_NEW_400()],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await changePassword({ currentPassword: 'orig', newPassword: 'short' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('validation')
+    expect(result.error.param).toBe('new_password')
+    expect(authStore.getSnapshot().status).toBe('authenticated') // unchanged
+  })
+
+  it('a dead session (401 after a failed refresh) reports unauthenticated and wipes the client state', async () => {
+    authStore.setAuthenticated(USER, 'st-live')
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.changePassword, () => jsonResponse(401, { status: 401 })],
+      [AUTH_URL.refresh, () => jsonResponse(400, { status: 400 })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await changePassword({ currentPassword: 'orig', newPassword: 'brand-new-999' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('unauthenticated')
+    expect(result.passwordChanged).toBeUndefined()
+    // request() ran the refresh recovery exactly once — no loop: one
+    // original call, one failed refresh, and (refresh failed) no retry
+    expect(callFor(calls, '/account/password/change')).toHaveLength(1)
+    expect(callFor(calls, '/tokens/refresh')).toHaveLength(1)
+    const snapshot = authStore.getSnapshot()
+    expect(snapshot.status).toBe('unauthenticated')
+    expect(snapshot.user).toBeNull()
+  })
+
+  it('a 429 reports rate_limited', async () => {
+    const { fetchMock } = mockBackend([
+      [AUTH_URL.changePassword, () => jsonResponse(429, { status: 429 })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await changePassword({ currentPassword: 'orig', newPassword: 'brand-new-999' })
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('rate_limited')
+  })
+
+  it('a network failure yields a result object, not a throw', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('failed to fetch'))))
+
+    const result = await changePassword({ currentPassword: 'orig', newPassword: 'brand-new-999' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('error')
+    expect(result.error.network).toBe(true)
+    expect(result.passwordChanged).toBeUndefined()
   })
 })
 

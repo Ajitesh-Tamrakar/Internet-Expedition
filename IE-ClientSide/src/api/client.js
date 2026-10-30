@@ -39,6 +39,12 @@ export const AUTH_URL = {
   config: '/api/auth/app/v1/config',
   requestPasswordReset: '/api/auth/app/v1/auth/password/request',
   resetPassword: '/api/auth/app/v1/auth/password/reset',
+  // Allauth's stock headless ChangePasswordView — the project mounts the
+  // whole allauth headless URL tree (bookmark/urls.py, "password
+  // reset/change"), which puts this under the `account/` prefix, not
+  // `auth/` (that prefix is where reset lives). Authenticated; body is
+  // {current_password, new_password}.
+  changePassword: '/api/auth/app/v1/account/password/change',
 }
 
 // Same-origin in production; the backend's default dev port otherwise.

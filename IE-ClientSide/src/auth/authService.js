@@ -497,6 +497,134 @@ export async function resendVerification() {
 }
 
 // ---------------------------------------------------------------------------
+// Password change (authenticated) — planning section 5
+//
+// The backend supports an authenticated change through allauth's stock
+// headless ChangePasswordView, mounted by the project at
+// POST account/password/change (bookmark/urls.py includes the whole
+// allauth headless tree; that view is part of it):
+//
+//   POST auth…  account/password/change  {current_password, new_password}
+//
+//   - 200 — the password was set. Two things happen server-side that the
+//     client must account for (verified against the installed
+//     django-allauth 65.21.0):
+//       * the user stays signed in (LOGOUT_ON_PASSWORD_CHANGE is off),
+//         but allauth mints NO new tokens for a user who was already
+//         authenticated — while the previous session (and with it the
+//         browser's access and refresh cookies) is dead;
+//       * the response carries the user payload and a fresh
+//         meta.session_token only.
+//     So the SPA's token pair is gone after a 200. To restore the
+//     "stays signed in" semantics, changePassword() auto-logs-in with
+//     the new password — the same pattern resetPassword() uses (a login
+//     mints the fresh token pair the browser needs).
+//   - 400 — the current password was wrong, or the new password failed
+//     a validator (Django's AUTH_PASSWORD_VALIDATORS); `errors[]` carry
+//     `param` for field-level display.
+//   - 401 — no live session (a 401 here passes through request()'s
+//     refresh-then-retry first; if the refresh fails, the session is
+//     gone and the client flips to unauthenticated).
+//   - 429 — rate limited.
+//
+// Result semantics (mirrors resetPassword's resetCompleted flag):
+//   `passwordChanged: true` is set on every result in which the password
+//   was actually set, so a page can say "your password has been changed"
+//   even when the follow-up auto-login then failed:
+//     - ok + 'authenticated'      — changed AND re-signed in (the normal
+//                                   case; the user stays on the page);
+//     - 'verification_pending' / 'credentials_invalid' / 'rate_limited' /
+//       'unauthenticated' / 'error' — changed, but the auto-login did
+//       not complete; the page tells the user to sign in with the new
+//       password (the store is unauthenticated, so the route guard
+//       takes them to Login either way).
+//   Without `passwordChanged` the change itself failed and no login was
+//   attempted: 'validation' (400), 'unauthenticated' (401 after refresh
+//   failure), 'rate_limited' (429), 'error' (network/other).
+// ---------------------------------------------------------------------------
+
+/**
+ * Change the signed-in user's password, then auto-login with the new
+ * password to restore the session (see the section note for why).
+ */
+export async function changePassword({ currentPassword, newPassword }) {
+  let result
+  try {
+    result = await request(AUTH_URL.changePassword, {
+      method: 'POST',
+      body: { current_password: currentPassword, new_password: newPassword },
+      // authenticated: true (default) — a 401 from this request runs the
+      // client's refresh-then-retry recovery before giving up.
+    })
+  } catch (error) {
+    return { ok: false, status: 'error', error }
+  }
+
+  if (result.status === 200) {
+    // The password was set, but the browser's tokens are dead now (the
+    // backend minted no replacements) — auto-login with the new
+    // credentials, exactly like resetPassword() does. login() itself
+    // resumes any stored pending-flow token and maps every outcome
+    // (including the 410 retry when that token is dead).
+    const email = authStore.getSnapshot().user?.email
+    if (email) {
+      const loginResult = await login({ email, password: newPassword })
+      if (!(loginResult.ok && loginResult.status === 'authenticated')) {
+        // The change killed the previous session and the auto-login did
+        // not restore one — the store's "authenticated" state is now a
+        // lie (every request would 401). Normalize to unauthenticated,
+        // keeping the pending-flow token in the one case where it is the
+        // flow's lifeline (verification still required).
+        authStore.setUnauthenticated(
+          loginResult.status === 'verification_pending'
+            ? { keepSessionToken: true }
+            : {}
+        )
+      }
+      return { ...loginResult, passwordChanged: true }
+    }
+    // No email to log in with (a session whose user payload is
+    // incomplete): the tokens are dead regardless — sign the user out
+    // and say where to go rather than stranding them.
+    authStore.setUnauthenticated()
+    return {
+      ok: false,
+      status: 'unauthenticated',
+      passwordChanged: true,
+      error: new ApiError({
+        status: 200,
+        message: 'Your password has been changed. Please sign in with it.',
+      }),
+    }
+  }
+
+  if (result.status === 400) {
+    // Wrong current password and a rejected new password both 400 with
+    // per-field errors (see the section note) — the session itself is
+    // alive, so the store is left alone.
+    return { ok: false, status: 'validation', error: toApiError(result) }
+  }
+
+  if (result.status === 401) {
+    // request() already ran refresh recovery; a 401 past it means the
+    // session is gone (the client layer flipped the store).
+    return {
+      ok: false,
+      status: 'unauthenticated',
+      error: toApiError(
+        result,
+        'Your session is no longer active. Please sign in again.'
+      ),
+    }
+  }
+
+  if (result.status === 429) {
+    return { ok: false, status: 'rate_limited', error: toApiError(result) }
+  }
+  return unexpected(result, 'validation')
+}
+
+// ---------------------------------------------------------------------------
 // Password recovery (link-based)
 //
 // The backend's recovery flow (allauth, mounted at the same headless
