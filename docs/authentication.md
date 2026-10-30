@@ -410,6 +410,8 @@ async function api(url, opts) {
 | `EMAIL_VERIFICATION_MAX_RESEND_COUNT` | 3 | (via `EMAIL_VERIFICATION_SUPPORTS_RESEND = 3`) |
 | `EMAIL_UNKNOWN_ACCOUNTS` | `True` | "No account with this email" mail on login failure |
 | `EMAIL_RATE_LIMITS` | `3/1m, 100/24h, 10/24h-unknown` | Per-address confirmation-mail throttling |
+| `EMAIL_BACKEND` / `ANYMAIL` | `anymail.backends.resend.EmailBackend` | Mail leaves via **Resend's HTTP API** (AnyMail), not SMTP — the deploy target (Railway) blocks outbound SMTP. Key = `ANYMAIL_RESEND_API_KEY` env var (falls back to `RESEND_API_KEY`); unset = sends fail at send time. Hostinger `EMAIL_HOST*` vars are gone. |
+| `DEFAULT_FROM_EMAIL` | env var; default `onboarding@resend.dev` | `onboarding@resend.dev` is Resend's test-sending address (really delivers). Production: verify the own domain at resend.com/domains and use it (e.g. `no-reply@ajiteshtamrakar.com`). |
 | `AUTH_API_PREFIX` | `/api/auth/` | Where the headless API is mounted |
 | `REST_FRAMEWORK DEFAULT_AUTHENTICATION_CLASSES` | allauth `JWTTokenAuthentication` | The DRF side of the token contract |
 | MIDDLEWARE | + `core.auth.middleware.AccessTokenBridgeMiddleware` + `core.auth.middleware.RefreshCookieMiddleware` | Bridge = access cookie → `Authorization` header (before `AuthenticationMiddleware`); RefreshCookie = refresh-token body↔cookie translation, access-token mirror, and logout clearing (after allauth's `AccountMiddleware`) |

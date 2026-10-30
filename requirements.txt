@@ -13,6 +13,7 @@ defusedxml==0.7.1
 distro==1.9.0
 Django==5.2.14
 django-allauth==65.21.0
+django-anymail==15.2
 django-cors-headers==4.9.0
 django-environ==0.13.0
 django-picklefield==3.4.0

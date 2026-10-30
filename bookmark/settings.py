@@ -213,17 +213,26 @@ ACCOUNT_EMAIL_VERIFICATION_SUPPORTS_RESEND = env.int(
 # 6-digit numeric codes for all user-facing codes (email verification).
 ALLAUTH_USER_CODE_FORMAT = {"numeric": True, "length": 6, "dashed": False}
 
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-
-EMAIL_HOST = env('EMAIL_HOST', default=env('EMAIL_HOST', default='localhost')) #type: ignore
-EMAIL_PORT = env.int('EMAIL_PORT', default=env.int('EMAIL_PORT', default=1025)) #type: ignore
-EMAIL_USE_SSL = env.bool('EMAIL_USE_SSL', default=env.bool('EMAIL_USE_SSL', default=False)) #type: ignore
-EMAIL_USE_TLS = env.bool('EMAIL_USE_TLS', default=env.bool('EMAIL_USE_TLS', default=False)) #type: ignore
-
-EMAIL_HOST_USER = env('EMAIL_HOST_USER', default=env('EMAIL_HOST_USER', default='')) #type: ignore
-EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default=env('EMAIL_HOST_PASSWORD', default='')) #type: ignore
-
-DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default=env('DEFAULT_FROM_EMAIL', default='webmaster@localhost')) #type: ignore
+# Outbound email — Resend, via AnyMail's HTTP API backend (not SMTP).
+# The deploy target (Railway) blocks outbound SMTP, but the Resend API is
+# plain HTTPS, so the same backend works in local dev and in deployment.
+# Anything that uses django.core.mail (allauth's verification-code mails
+# etc.) is unaffected by the swap; tests always use the locmem backend.
+EMAIL_BACKEND = env.str("EMAIL_BACKEND",
+                        default="anymail.backends.resend.EmailBackend")
+ANYMAIL = {
+    # Resend dashboard -> API keys. AnyMail also reads ANYMAIL_RESEND_API_KEY
+    # from the environment on its own; the explicit mapping keeps the key
+    # visible in settings. Unset = the app boots fine, individual sends
+    # fail at send time (tests are unaffected — they use locmem).
+    "RESEND_API_KEY": env.str("ANYMAIL_RESEND_API_KEY",
+                              default=env.str("RESEND_API_KEY", default="")),
+}
+# onboarding@resend.dev is Resend's test-sending address (it really
+# delivers). Production: verify the own domain at resend.com/domains and
+# point this at it (e.g. no-reply@ajiteshtamrakar.com).
+DEFAULT_FROM_EMAIL = env.str("DEFAULT_FROM_EMAIL",
+                             default="onboarding@resend.dev")
 
 # ------------------------------------------------------------------
 # Headless API + allauth's built-in JWT strategy
