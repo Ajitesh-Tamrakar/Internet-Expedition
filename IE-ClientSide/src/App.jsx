@@ -4,6 +4,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { initSession, useAuth } from './auth'
 import { LoadingScreen, RedirectIfAuthenticated, RequireAuth } from './auth/guards'
 import LoginPage from './pages/LoginPage'
+import ResetPasswordPage from './pages/ResetPasswordPage'
 import SearchPage from './pages/SearchPage'
 import SignupPage from './pages/SignupPage'
 
@@ -46,6 +47,15 @@ export default function App() {
           </RedirectIfAuthenticated>
         }
       />
+      {/*
+       * The password-reset mail links here (?token=…). Deliberately NOT
+       * wrapped in the authenticated-redirect guard: the endpoint is
+       * public and a signed-in user may still need to finish a reset —
+       * the store flips after a successful one, which takes care of the
+       * /login redirect afterwards. (Path must match the backend's
+       * HEADLESS_FRONTEND_URLS entries in bookmark/settings.py.)
+       */}
+      <Route path="/account/password/reset" element={<ResetPasswordPage />} />
       <Route
         path="/search"
         element={

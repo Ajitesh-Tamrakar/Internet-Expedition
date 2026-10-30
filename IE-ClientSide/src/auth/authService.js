@@ -29,6 +29,11 @@
  *   'session_gone'               — 410; the resumed session no longer
  *                                  exists (the stored token was dropped)
  *   'no_pending_flow'            — client-side guard: nothing to resume
+ *   'requested' (ok)             — a password-reset email was requested
+ *                                  (enumeration-safe 200)
+ *   'link_valid' (ok)            — a reset link's token verified (the
+ *                                  account it belongs to is in `user`)
+ *   'link_invalid'               — a reset link is missing/invalid/expired
  *   'validation' | 'forbidden'   — request rejected before the flow
  *   'rate_limited' | 'unauthenticated' | 'error'
  *
@@ -488,6 +493,177 @@ export async function resendVerification() {
     return { ok: false, status: 'session_gone', error: toApiError(result) }
   }
 
+  return unexpected(result, 'validation')
+}
+
+// ---------------------------------------------------------------------------
+// Password recovery (link-based)
+//
+// The backend's recovery flow (allauth, mounted at the same headless
+// paths; settings.HEADLESS_FRONTEND_URLS points its mail link at the
+// frontend):
+//
+//   1. POST auth/password/request  {"email"}        → 200, mails a link
+//   2. the link opens /account/password/reset?token=… in the SPA
+//   3. GET  auth/password/reset (X-Password-Reset-Key: token) → link check
+//   4. POST auth/password/reset    {"key", "password"}        → done
+//
+// Step 4 is the one with teeth: the backend sets the password but does
+// NOT sign the user in (LOGIN_ON_PASSWORD_RESET is off —
+// docs/authentication.md), so a *successful* reset answers 401 with the
+// login flow and no tokens. resetPassword() then calls login() with the
+// new credentials itself (auto-login); the page only ever sees the
+// settled outcome.
+// ---------------------------------------------------------------------------
+
+/**
+ * Request a password-reset email: `POST auth/password/request`
+ * `{"email"}`.
+ *
+ * Enumeration-safe on the backend: the 200 is the same answer for a
+ * registered and an unregistered address, so callers must phrase the
+ * confirmation as "if an account exists, …". The mail carries a link to
+ * the frontend's `/account/password/reset?token=…` route (ResetPasswordPage).
+ *
+ * Outcomes:
+ *  - 'requested' (200) — the mail went out (or the "no such account"
+ *    mail did); the page shows the enumeration-safe confirmation.
+ *  - 'validation' (400) — e.g. a malformed email address.
+ *  - 'rate_limited' (429), 'error' (network/other).
+ */
+export async function requestPasswordReset({ email }) {
+  let result
+  try {
+    result = await request(AUTH_URL.requestPasswordReset, {
+      method: 'POST',
+      body: { email },
+      authenticated: false, // public endpoint; a 401 is not a refresh trigger
+    })
+  } catch (error) {
+    return { ok: false, status: 'error', error }
+  }
+
+  if (result.status === 200) {
+    return { ok: true, status: 'requested', email }
+  }
+  if (result.status === 400) {
+    return { ok: false, status: 'validation', error: toApiError(result) }
+  }
+  if (result.status === 429) {
+    return { ok: false, status: 'rate_limited', error: toApiError(result) }
+  }
+  return unexpected(result, 'validation')
+}
+
+/**
+ * Check a reset link: `GET auth/password/reset` with the token as the
+ * `X-Password-Reset-Key` header.
+ *
+ * The emailed link lands on `/account/password/reset?token=…`; that page
+ * calls this on mount so the user is told immediately whether the link
+ * is still good (and which account it is for) instead of finding out
+ * only after typing a new password.
+ *
+ * Outcomes:
+ *  - 'link_valid' (200) — the token is live; `user` is the account it
+ *    belongs to.
+ *  - 'link_invalid' (400) — the token is missing, malformed, or expired.
+ *  - 'error' (network/other).
+ */
+export async function verifyResetLink(token) {
+  let result
+  try {
+    result = await request(AUTH_URL.resetPassword, {
+      method: 'GET',
+      authenticated: false, // public endpoint (see the section note)
+      headers: { 'X-Password-Reset-Key': token },
+    })
+  } catch (error) {
+    return { ok: false, status: 'error', error }
+  }
+
+  if (result.status === 200) {
+    return { ok: true, status: 'link_valid', user: result.body?.data?.user ?? null }
+  }
+  if (result.status === 400) {
+    return { ok: false, status: 'link_invalid', error: toApiError(result) }
+  }
+  return unexpected(result, 'validation')
+}
+
+/**
+ * Complete a password reset: `POST auth/password/reset`
+ * `{"key": <token>, "password"}`.
+ *
+ * `email` is the address the user signed up with (from the link check);
+ * it is what the follow-up auto-login needs — see the section note for
+ * why the reset itself does not produce a session.
+ *
+ * Outcomes:
+ *  - 'authenticated' (ok) — the password was set AND the follow-up login
+ *    signed the user in (either the backend did it itself, or the
+ *    auto-login did).
+ *  - `resetCompleted: true` on every result in which the password was
+ *    actually set, so a page can say "your password has been changed"
+ *    even when the follow-up login then failed:
+ *    - 'verification_pending' — the account must verify its email first
+ *      (a fresh code was emailed; resume it from the login page);
+ *    - 'credentials_invalid' / 'rate_limited' / 'error' — the auto-login
+ *      hit a wall; the user logs in manually with the new password.
+ *  - without `resetCompleted` the reset itself failed and no login was
+ *    attempted: 'link_invalid' (400 invalid token), 'validation' (400
+ *    rejected password), 'flow_expired' (409), 'rate_limited' (429),
+ *    'error' (network/other).
+ */
+export async function resetPassword({ key, email, password }) {
+  let result
+  try {
+    result = await request(AUTH_URL.resetPassword, {
+      method: 'POST',
+      body: { key, password },
+      authenticated: false, // public endpoint (see the section note)
+    })
+  } catch (error) {
+    return { ok: false, status: 'error', error }
+  }
+
+  // A 200 with a live session is what LOGIN_ON_PASSWORD_RESET=True would
+  // produce; honor it if it ever happens.
+  if (result.status === 200 && result.body?.meta?.is_authenticated) {
+    const user = result.body?.data?.user ?? null
+    authStore.setAuthenticated(user, result.body?.meta?.session_token ?? null)
+    return { ok: true, status: 'authenticated', user, resetCompleted: true }
+  }
+
+  // The usual case: the password is set, the answer is a 401 (login
+  // available, no session) — or, defensively, a 200 without one.
+  const completed = result.status === 401 || result.status === 200
+  if (completed) {
+    // Auto-login with the new credentials. login() itself resumes any
+    // stored pending-flow token (self-healing for a never-verified
+    // account) and maps every outcome.
+    const loginResult = await login({ email, password })
+    return { ...loginResult, resetCompleted: true }
+  }
+
+  if (result.status === 400) {
+    const error = toApiError(result)
+    return {
+      ok: false,
+      status: error.code === 'invalid_password_reset' ? 'link_invalid' : 'validation',
+      error,
+    }
+  }
+  if (result.status === 409) {
+    return {
+      ok: false,
+      status: 'flow_expired',
+      error: toApiError(result, 'This password reset has already been used or expired.'),
+    }
+  }
+  if (result.status === 429) {
+    return { ok: false, status: 'rate_limited', error: toApiError(result) }
+  }
   return unexpected(result, 'validation')
 }
 

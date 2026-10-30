@@ -14,7 +14,10 @@ export {
   initSession,
   login,
   logout,
+  requestPasswordReset,
   resendVerification,
+  resetPassword,
   signup,
   verifyEmail,
+  verifyResetLink,
 } from './authService'

@@ -37,6 +37,9 @@ headless app client adds `app/v1/`.
 | `POST auth/login` | — | Email + password login |
 | `POST auth/email/verify` | pending flow | Confirm the 6-digit code |
 | `POST auth/email/verify/resend` | pending flow | Re-issue the code |
+| `POST auth/password/request` | — | Mail a password-reset link (see [Password recovery](#password-recovery-link-based)) |
+| `GET  auth/password/reset` | `X-Password-Reset-Key` | Validate a reset link (returns the account) |
+| `POST auth/password/reset` | `X-Password-Reset-Key` via body `key` | Set the new password |
 | `GET  auth/session` | Bearer | Current session (user payload, flows, tokens) |
 | `DELETE auth/session` | Bearer | Logout (kills tokens, clears cookie) |
 | `POST tokens/refresh` | refresh token (body **or** cookie) | New access token; rotates refresh |
@@ -171,6 +174,42 @@ No body. `200` and a fresh code email (old code dies; the window restarts).
   `meta.session_token`, **no access/refresh token**, and a fresh code email
   (self-healing: verify with it and the login completes).
 - `X-Session-Token` referencing a dead session → `410` (Gone).
+
+## Password recovery (link-based)
+
+The project uses allauth's **link-based** password reset
+(`PASSWORD_RESET_BY_CODE_ENABLED` unset → off). It is a three-step,
+fully-public flow — no session is required or used:
+
+1. `POST auth/password/request` `{"email": "…"}` → `200` and a reset email.
+   The 200 is **enumeration-safe** (the same answer for a registered and an
+   unregistered address — the latter gets the "no such account" mail, since
+   `EMAIL_UNKNOWN_ACCOUNTS = True`), so clients must phrase the
+   confirmation as "if an account exists, …".
+2. The email links to the **frontend** route
+   `/account/password/reset?token=<uidb36>-<key>` — the URL comes from
+   `HEADLESS_FRONTEND_URLS["account_reset_password_from_key"]` (which must
+   carry the `{key}` placeholder, or the request 500s in
+   `render_url`). The SPA reads `?token` and may pre-check it:
+   `GET auth/password/reset` with the token as the
+   `X-Password-Reset-Key` header → `200` `data.user` (the account the link
+   belongs to) or `400` `{"code": "invalid_password_reset"}` (missing /
+   malformed / expired token).
+3. `POST auth/password/reset` `{"key": "<token>", "password": "…"}` sets
+   the password. Because `LOGIN_ON_PASSWORD_RESET` is **off** (unset), the
+   backend does **not** sign the user in: the response is `401` with
+   `meta.is_authenticated: false` and the `login` flow in `data.flows`, and
+   **no tokens**. The client completes the loop by calling
+   `POST auth/login` with the new credentials (auto-login); if the account
+   is still email-unverified that login `401`s with `verify_email` pending,
+   exactly like a normal login. (If `LOGIN_ON_PASSWORD_RESET` is ever
+   enabled, the reset `200`s with a live session instead — clients should
+   accept both.)
+
+The SPA implements this in `IE-ClientSide/src/pages/LoginPage.jsx`
+("Forgot password?" → step 1) and `ResetPasswordPage.jsx` (steps 2–3), on
+top of `requestPasswordReset` / `verifyResetLink` / `resetPassword` in
+`src/auth/authService.js`.
 
 ## Session
 

@@ -37,6 +37,8 @@ export const AUTH_URL = {
   session: '/api/auth/app/v1/auth/session',
   refresh: '/api/auth/app/v1/tokens/refresh',
   config: '/api/auth/app/v1/config',
+  requestPasswordReset: '/api/auth/app/v1/auth/password/request',
+  resetPassword: '/api/auth/app/v1/auth/password/reset',
 }
 
 // Same-origin in production; the backend's default dev port otherwise.
@@ -108,8 +110,8 @@ export function toApiError(result, fallback = null) {
  * JSON object, or `null` when the response was not parseable JSON.
  * Throws ApiError (network) only when the request never completed.
  */
-async function transport(path, { method = 'GET', body, sessionToken } = {}) {
-  const headers = { Accept: 'application/json' }
+async function transport(path, { method = 'GET', body, sessionToken, headers: extraHeaders } = {}) {
+  const headers = { Accept: 'application/json', ...extraHeaders }
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   if (sessionToken) headers['X-Session-Token'] = sessionToken
 

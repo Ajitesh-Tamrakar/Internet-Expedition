@@ -7,9 +7,12 @@ import {
   initSession,
   login,
   logout,
+  requestPasswordReset,
   resendVerification,
+  resetPassword,
   signup,
   verifyEmail,
+  verifyResetLink,
 } from './authService'
 
 // Stable references so the hook's return value doesn't churn between
@@ -22,6 +25,9 @@ const actions = Object.freeze({
   verifyEmail,
   resendVerification,
   logout,
+  requestPasswordReset,
+  verifyResetLink,
+  resetPassword,
   getAuthConfig,
 })
 

@@ -6,7 +6,8 @@
  *
  * Covers the section-2 acceptance criteria: session initialization and
  * reload recovery, pending signup/verification flows (session token +
- * resend), login outcomes, logout, and predictable failure shapes.
+ * resend), login outcomes, the password-recovery operations (section 4),
+ * logout, and predictable failure shapes.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -17,9 +18,12 @@ import {
   initSession,
   login,
   logout,
+  requestPasswordReset,
   resendVerification,
+  resetPassword,
   signup,
   verifyEmail,
+  verifyResetLink,
 } from './authService'
 import { AUTH_URL } from '../api/client'
 
@@ -612,5 +616,281 @@ describe('logout()', () => {
     expect(result.ok).toBe(true)
     expect(result.status).toBe('logged_out')
     expect(authStore.getSnapshot().status).toBe('unauthenticated')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Password recovery (link-based)
+//
+// The backend contract (verified against the installed django-allauth
+// 65.21.0 and the project settings): a *successful* reset POST answers
+// 401 with the login flow and NO tokens, because LOGIN_ON_PASSWORD_RESET
+// is off. resetPassword() therefore auto-logs-in with the new
+// credentials. The exact response shapes below are the backend's.
+// ---------------------------------------------------------------------------
+
+describe('requestPasswordReset()', () => {
+  it('sends the email and reports "requested" on the enumeration-safe 200', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.requestPasswordReset, () => jsonResponse(200, { status: 200 })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await requestPasswordReset({ email: 'ada@example.com' })
+
+    expect(result.ok).toBe(true)
+    expect(result.status).toBe('requested')
+    const { url, options } = calls[0]
+    expect(url.endsWith('/auth/password/request')).toBe(true)
+    expect(JSON.parse(options.body)).toEqual({ email: 'ada@example.com' })
+  })
+
+  it('surfaces a validation failure (400)', async () => {
+    const { fetchMock } = mockBackend([
+      [AUTH_URL.requestPasswordReset, () =>
+        jsonResponse(400, {
+          status: 400,
+          errors: [{ message: 'Enter a valid email address.', code: 'invalid_email', param: 'email' }],
+        })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await requestPasswordReset({ email: 'nope' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('validation')
+    expect(result.error.message).toBe('Enter a valid email address.')
+  })
+
+  it('surfaces a rate limit (429)', async () => {
+    const { fetchMock } = mockBackend([
+      [AUTH_URL.requestPasswordReset, () => jsonResponse(429, { status: 429 })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await requestPasswordReset({ email: 'ada@example.com' })
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('rate_limited')
+  })
+
+  it('a network failure yields a result object, not a throw', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('failed to fetch'))))
+
+    const result = await requestPasswordReset({ email: 'ada@example.com' })
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('error')
+    expect(result.error.network).toBe(true)
+  })
+})
+
+describe('verifyResetLink()', () => {
+  it('GETs the reset endpoint with the token as X-Password-Reset-Key and returns the account', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.resetPassword, () =>
+        jsonResponse(200, { status: 200, data: { user: USER } })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await verifyResetLink('ada-key')
+
+    expect(result.ok).toBe(true)
+    expect(result.status).toBe('link_valid')
+    expect(result.user.email).toBe('ada@example.com')
+    const { options } = calls[0]
+    expect(options.method).toBe('GET')
+    expect(options.headers['X-Password-Reset-Key']).toBe('ada-key')
+  })
+
+  it('a 400 (missing/malformed/expired token) reports link_invalid with the backend message', async () => {
+    const { fetchMock } = mockBackend([
+      [AUTH_URL.resetPassword, () =>
+        jsonResponse(400, {
+          status: 400,
+          errors: [
+            { message: 'The password reset token was invalid.', code: 'invalid_password_reset', param: 'key' },
+          ],
+        })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await verifyResetLink('bogus')
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('link_invalid')
+    expect(result.error.message).toBe('The password reset token was invalid.')
+    expect(result.error.code).toBe('invalid_password_reset')
+  })
+
+  it('a network failure yields a result object, not a throw', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('failed to fetch'))))
+
+    const result = await verifyResetLink('ada-key')
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('error')
+    expect(result.error.network).toBe(true)
+  })
+})
+
+describe('resetPassword()', () => {
+  // The backend's actual shapes (from the installed allauth 65.21.0):
+  const RESET_SUCCESS_401 = () =>
+    jsonResponse(401, {
+      status: 401,
+      data: { flows: [{ id: 'login' }, { id: 'signup' }] },
+      meta: { is_authenticated: false },
+    })
+  const RESET_BAD_KEY_400 = () =>
+    jsonResponse(400, {
+      status: 400,
+      errors: [
+        { message: 'The password reset token was invalid.', code: 'invalid_password_reset', param: 'key' },
+      ],
+    })
+
+  it('a successful reset (401) auto-logs-in and becomes authenticated', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.resetPassword, () => RESET_SUCCESS_401()],
+      [AUTH_URL.login, () =>
+        jsonResponse(200, {
+          status: 200,
+          data: { user: USER, methods: [] },
+          meta: { is_authenticated: true, session_token: 'st-live', access_token: 'at-1' },
+        })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await resetPassword({ key: 'ada-key', email: 'ada@example.com', password: 'newpass' })
+
+    expect(result.ok).toBe(true)
+    expect(result.status).toBe('authenticated')
+    expect(result.resetCompleted).toBe(true)
+    expect(authStore.getSnapshot().status).toBe('authenticated')
+    // the reset POST + the follow-up login
+    expect(callFor(calls, '/auth/password/reset')).toHaveLength(1)
+    expect(callFor(calls, '/auth/login')).toHaveLength(1)
+    // the auto-login reuses the same credentials the user just set
+    const loginCall = callFor(calls, '/auth/login')[0]
+    expect(JSON.parse(loginCall.options.body)).toEqual({
+      email: 'ada@example.com',
+      password: 'newpass',
+    })
+  })
+
+  it('a reset that the backend itself logs in for (200 + is_authenticated) needs no follow-up login', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.resetPassword, () =>
+        jsonResponse(200, {
+          status: 200,
+          data: { user: USER, methods: [] },
+          meta: { is_authenticated: true, session_token: 'st-live', access_token: 'at-1' },
+        })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await resetPassword({ key: 'ada-key', email: 'ada@example.com', password: 'newpass' })
+
+    expect(result.ok).toBe(true)
+    expect(result.status).toBe('authenticated')
+    expect(result.resetCompleted).toBe(true)
+    // no login call — the backend signed the user in
+    expect(callFor(calls, '/auth/login')).toHaveLength(0)
+    expect(authStore.getSnapshot().status).toBe('authenticated')
+  })
+
+  it('a reset whose auto-login fails reports the login failure but resetCompleted stays true', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.resetPassword, () => RESET_SUCCESS_401()],
+      [AUTH_URL.login, () =>
+        jsonResponse(400, {
+          status: 400,
+          errors: [
+            {
+              message: 'The email address and/or password you specified are not correct.',
+              code: 'email_password_mismatch',
+              param: 'password',
+            },
+          ],
+        })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await resetPassword({ key: 'ada-key', email: 'ada@example.com', password: 'newpass' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('credentials_invalid')
+    // the password WAS changed even though the follow-up login did not
+    expect(result.resetCompleted).toBe(true)
+    expect(callFor(calls, '/auth/login')).toHaveLength(1)
+    // the session remains unauthenticated
+    expect(authStore.getSnapshot().status).toBe('unauthenticated')
+  })
+
+  it('a failed reset (invalid key, 400) reports link_invalid and never auto-logs-in', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.resetPassword, () => RESET_BAD_KEY_400()],
+      [AUTH_URL.login, () => jsonResponse(200, { status: 200, data: { user: USER } })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await resetPassword({ key: 'bogus', email: 'ada@example.com', password: 'newpass' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('link_invalid')
+    expect(result.error.code).toBe('invalid_password_reset')
+    // the reset did not happen — no auto-login, and no resetCompleted
+    expect(result.resetCompleted).toBeUndefined()
+    expect(callFor(calls, '/auth/login')).toHaveLength(0)
+  })
+
+  it('a password the backend rejects (400, not the key) reports validation', async () => {
+    const { fetchMock, calls } = mockBackend([
+      [AUTH_URL.resetPassword, () =>
+        jsonResponse(400, {
+          status: 400,
+          errors: [
+            { message: 'This password is too short. It must contain at least 8 characters.', code: 'password_too_short', param: 'password' },
+          ],
+        })],
+      [AUTH_URL.login, () => jsonResponse(200, { status: 200, data: { user: USER } })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await resetPassword({ key: 'ada-key', email: 'ada@example.com', password: 'short' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('validation')
+    expect(result.error.param).toBe('password')
+    expect(callFor(calls, '/auth/login')).toHaveLength(0)
+  })
+
+  it('a 409 reports flow_expired', async () => {
+    const { fetchMock } = mockBackend([
+      [AUTH_URL.resetPassword, () => jsonResponse(409, { status: 409 })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await resetPassword({ key: 'ada-key', email: 'ada@example.com', password: 'newpass' })
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('flow_expired')
+  })
+
+  it('a 429 reports rate_limited', async () => {
+    const { fetchMock } = mockBackend([
+      [AUTH_URL.resetPassword, () => jsonResponse(429, { status: 429 })],
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await resetPassword({ key: 'ada-key', email: 'ada@example.com', password: 'newpass' })
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('rate_limited')
+  })
+
+  it('a network failure yields a result object, not a throw', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('failed to fetch'))))
+
+    const result = await resetPassword({ key: 'ada-key', email: 'ada@example.com', password: 'newpass' })
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('error')
+    expect(result.error.network).toBe(true)
   })
 })

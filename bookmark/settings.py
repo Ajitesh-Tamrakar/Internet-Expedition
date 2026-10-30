@@ -268,11 +268,19 @@ HEADLESS_JWT_ROTATE_REFRESH_TOKEN = True
 # against the request origin by allauth; set FRONTEND_URL in deployment
 # to point the links at the real frontend.
 FRONTEND_URL = env.str("FRONTEND_URL", default="")
+# `?token={{key}}` (renders as the literal `{key}` placeholder) is REQUIRED
+# for any urlname allauth renders with a key argument — render_url raises
+# ImproperlyConfigured (500) if the template lacks it. Without it, EVERY
+# password-reset request 500s (the from_key URL is the one the link-based
+# reset mail always renders). The SPA reads the token from `?token` at the
+# routes below (IE-ClientSide: /account/password/reset; the confirm route
+# is never linked while verification is by-code, but carries the placeholder
+# for the same reason).
 HEADLESS_FRONTEND_URLS = {
-    "account_confirm_email": f"{FRONTEND_URL}/account/verify-email",
+    "account_confirm_email": f"{FRONTEND_URL}/account/verify-email?token={{key}}",
     "account_reset_password": f"{FRONTEND_URL}/account/password/reset",
     "account_reset_password_from_key": (
-        f"{FRONTEND_URL}/account/password/reset"),
+        f"{FRONTEND_URL}/account/password/reset?token={{key}}"),
     "account_signup": f"{FRONTEND_URL}/account/signup",
     "socialaccount_login_error": f"{FRONTEND_URL}/account",
 }
