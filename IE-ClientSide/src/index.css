@@ -213,3 +213,75 @@ body {
   text-decoration: underline;
   cursor: pointer;
 }
+
+/* --- Protected pages (Search / Account) — section 7 layout --- */
+
+/* The signed-in part of the app: a column of the full viewport, the
+   nav on top and the page filling what is left. */
+
+.protected {
+  display: flex;
+  flex-direction: column;
+  min-height: 100svh;
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 20px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 15%, transparent);
+}
+
+.nav-brand {
+  margin-right: auto;
+  font-weight: 700;
+  color: inherit;
+  text-decoration: none;
+}
+
+.nav-links {
+  display: flex;
+  gap: 4px;
+}
+
+.nav-link {
+  padding: 6px 12px;
+  border-radius: 6px;
+  color: inherit;
+  text-decoration: none;
+  opacity: 0.7;
+}
+
+.nav-link:hover {
+  opacity: 1;
+}
+
+/* NavLink's active mark — the page the user is on. */
+
+.nav-link.active {
+  opacity: 1;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* The content area flex-fills below the nav. It is a flex row so the
+   page container stretches to its full height — which is what lets the
+   pages' flex centering work on the *remaining* space: */
+
+.protected-content {
+  display: flex;
+  flex: 1;
+}
+
+/* The page containers center themselves with a 100svh floor (correct
+   when they own the viewport); under the nav that floor would overflow
+   by the nav's height, so inside the layout they are flex-stretched to
+   the content area and the floor is dropped. */
+
+.protected .app-shell,
+.protected .account-page {
+  flex: 1;
+  min-height: 0;
+}

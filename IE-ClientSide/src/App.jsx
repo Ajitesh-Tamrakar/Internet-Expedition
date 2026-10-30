@@ -1,8 +1,9 @@
 import { useEffect } from 'react'
-import { Navigate, Route, Routes } from 'react-router-dom'
+import { Navigate, Outlet, Route, Routes } from 'react-router-dom'
 
 import { initSession, useAuth } from './auth'
 import { LoadingScreen, RedirectIfAuthenticated, RequireAuth } from './auth/guards'
+import Nav from './components/Nav'
 import LoginPage from './pages/LoginPage'
 import ResetPasswordPage from './pages/ResetPasswordPage'
 import SearchPage from './pages/SearchPage'
@@ -11,13 +12,35 @@ import UserInfoPage from './pages/UserInfoPage'
 
 /**
  * `/` — send the user where their session says they belong. A logged-in
- * user lands on Search; everyone else on Login. (Section 7 makes the
- * full navigation contract explicit; this is its core.)
+ * user lands on Search; everyone else on Login.
  */
 function RootRedirect() {
   const { isAuthenticated, isAuthLoading } = useAuth()
   if (isAuthLoading) return <LoadingScreen />
   return <Navigate to={isAuthenticated ? '/search' : '/login'} replace />
+}
+
+/**
+ * The chrome of the signed-in part of the app (planning section 7): the
+ * top navigation and the page it wraps. It is mounted inside
+ * RequireAuth (on the route below), so a logged-out visitor never sees
+ * the nav at all — the guard redirects to Login *instead of* rendering
+ * this. Protected access is a routing decision, not hidden UI.
+ *
+ * The nav is the intended connection between Search and Account (and
+ * the brand's "/" link routes through RootRedirect, i.e. also to
+ * Search); the other edges of the navigation graph are the pages'
+ * own: Login/Signup → Search on success, Account → Login on sign-out.
+ */
+function ProtectedLayout() {
+  return (
+    <div className="protected">
+      <Nav />
+      <div className="protected-content">
+        <Outlet />
+      </div>
+    </div>
+  )
 }
 
 export default function App() {
@@ -58,27 +81,23 @@ export default function App() {
        */}
       <Route path="/account/password/reset" element={<ResetPasswordPage />} />
       {/*
-       * The user information page (section 5): the signed-in user's
-       * name/email plus sign-out and change-password. Protected — the
-       * reset route above is a sibling pattern, not a parent, so the two
-       * coexist. (The navigation that links here lands in section 7.)
+       * The protected pages (section 7): Search and the user information
+       * page share the RequireAuth-gated nav layout — one guard covers
+       * both (and any future protected route added under this layout):
+       * a logged-out visitor is redirected to Login before the nav is
+       * ever rendered, a live session gets the page plus the navigation.
+       * The reset route above stays outside: it is public by contract.
        */}
       <Route
-        path="/account"
         element={
           <RequireAuth>
-            <UserInfoPage />
+            <ProtectedLayout />
           </RequireAuth>
         }
-      />
-      <Route
-        path="/search"
-        element={
-          <RequireAuth>
-            <SearchPage />
-          </RequireAuth>
-        }
-      />
+      >
+        <Route path="/search" element={<SearchPage />} />
+        <Route path="/account" element={<UserInfoPage />} />
+      </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )

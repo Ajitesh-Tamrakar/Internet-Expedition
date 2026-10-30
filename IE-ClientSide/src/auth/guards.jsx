@@ -1,7 +1,7 @@
 /**
- * Route guards, bound to the session store (planning section 3 — the
- * minimal scaffolding the pages need; section 7 finishes the
- * end-to-end navigation integration).
+ * Route guards, bound to the session store. They are the client's
+ * consistent answer to "who may see this" (planning section 7:
+ * protected access is a routing decision, not hidden page elements).
  *
  * Both wait out the initial session probe (isAuthLoading) before
  * deciding, so an authenticated user reloading on a public page is

@@ -29,12 +29,12 @@
  * — or a failed change auto-login — the store flips to unauthenticated,
  * which the guard turns into a redirect to Login; the page also
  * navigates explicitly so the user isn't left watching the guard work.
- * (The top-level navigation that links here is section 7's job; the
- * back link below keeps the page reachable in the meantime.)
+ * The page connects to Search through the app's top navigation (the
+ * section-7 nav layout in src/App.jsx) — no in-page back link needed.
  */
 
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 
 import { useAuth } from '../auth'
 
@@ -325,10 +325,6 @@ export default function UserInfoPage() {
           {signingOut ? 'Signing out…' : 'Sign out'}
         </button>
       </section>
-
-      <p className="auth-switch">
-        <Link to="/search">Back to Search</Link>
-      </p>
     </main>
   )
 }
