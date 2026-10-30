@@ -116,6 +116,23 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_ALL_ORIGINS = DEBUG
+# Request headers the SPA sends that the library default does not cover
+# (src/api/client.js): the allauth resumption handle on verify/resend/
+# login-with-pending-flow, and the reset-link check key. The preflight
+# still answers 200 without these — only the *browser* then refuses to
+# send the real request, and the client sees it as a network error
+# ("Can't reach the server") while the server logs show the preflight
+# "succeeding" (a 200 with no follow-up POST — the classic red herring).
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
+    "x-session-token",
+    "x-password-reset-key",
+]
 # Application definition
 
 INSTALLED_APPS = [
