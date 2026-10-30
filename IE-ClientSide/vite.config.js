@@ -13,5 +13,8 @@ export default defineConfig({
     env: {
       VITE_API_BASE_URL: '',
     },
+    // jest-dom matchers for the Testing Library page tests (the file
+    // opts into jsdom with a per-file @vitest-environment pragma).
+    setupFiles: ['./src/test/setup.js'],
   },
 })
