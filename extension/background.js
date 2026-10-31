@@ -475,24 +475,51 @@ listen(MSG.USER, handleUser);
 // validation or the registration.
 
 // SAVE — content script → worker (request/response). Contract §8 owns
-// the operation; its v1-shaped body (platform detection → the router
-// below) stands until §8's canonical-capture multipart submission
-// replaces it. §3 adds the payload validation.
-function handleSave(message, sender, sendResponse) {
-    console.log("Received message in background:", message);
-
-    // Required field (rule 5): the capture payload — every content
-    // script sends { type, data } (the v1 envelope). The canonical
-    // four-field shape inside it is §8's validation.
+// the operation (the CAPTURE COORDINATION section below): the v1
+// envelope is translated into the canonical four-field object,
+// validated, and submitted always-multipart. §3 owns the registration
+// and the required-field validation below.
+//
+// The "sender-side reshape note" (contract §8): the v1 content scripts
+// send the v1 envelope (their established shapes) — the worker is the
+// single point where that envelope is translated into the canonical
+// four-field object. The content scripts are not rewritten: the
+// injected save button and the confirmation toast stay byte-identical;
+// only the worker-side submission changes. (The v1 body's console.log of
+// the whole message goes with the v1 body — the payload carries the
+// multi-hundred-KB base64 screenshot, which the §4 token-sink
+// discipline keeps out of the worker console.)
+async function handleSave(message, _sender, sendResponse) {
+    // Required field (rule 5): every content script sends { type, data }
+    // (the v1 envelope).
     if (typeof message.data !== "object" || message.data === null) {
         sendResponse({ status: STATUS.ERROR, code: 0, error: "SAVE requires a capture payload (data)" });
         return;
     }
 
-    const platform = detectPlatform(sender);
-    console.log("Detected platform:", platform);
+    // §8: the v1 envelope → the canonical four-field capture object.
+    const canonical = toCanonicalCapture(message.data);
 
-    routeSave(platform, message.data, sendResponse);
+    // Shape validation (rule 5; acceptance 3): nothing usable in any of
+    // the four fields → a structured error, nothing submitted.
+    if (!hasUsableContent(canonical)) {
+        sendResponse({
+            status: STATUS.ERROR,
+            code: 0,
+            error: "SAVE has no usable content (text, media, screenshot, or source_url)",
+        });
+        return;
+    }
+
+    // The screenshot's data-URL → the one file part. A conversion
+    // failure degrades to no screenshot (the field is optional) — the
+    // capture proceeds, never fails on it.
+    const screenshot = canonical.image ? await screenshotToFile(canonical.image) : null;
+
+    // The §3 safe-failure backstop owns any rejection from here: the
+    // dispatcher's exactly-once respond wrapper answers a thrown tail
+    // with the code-0 ERROR envelope (rule 8).
+    await postCapture(buildCaptureForm(canonical, screenshot), sendResponse);
 }
 
 // SESSION_EVENT — relay → worker (fire-and-forget; the sender is
@@ -702,73 +729,261 @@ async function handleUser(_message, _sender, sendResponse) {
 }
 
 // ===========================
-// PLATFORM DETECTION (v1 — contract §8's territory)
+// CAPTURE COORDINATION (contract §8 — Background F: capture coordination)
 // ===========================
+//
+// Contract §8's operation for SAVE: the worker is the single point where
+// the v1 envelope (the content scripts' established shape — they stay
+// byte-identical, the "sender-side reshape note") is translated into the
+// canonical four-field capture object, validated, and submitted
+// always-multipart on the §5 FormData seam. `platform` is not a payload
+// field — the worker is platform-agnostic past this translation (rework
+// §3: the backend keys its per-platform work off `source_url`) — so the
+// v1 `detectPlatform` and the v1 router die with the rewrite: every
+// platform takes this one path. The context menu + `CAPTURE_WEB` send
+// stay exactly as they are (contract §8: "Context menu: unchanged").
 
-function detectPlatform(sender) {
-    const url = sender?.tab?.url || "";
-    if (url.includes("youtube.com"))   return "youtube";
-    if (url.includes("twitter.com") || url.includes("x.com")) return "twitter";
-    if (url.includes("linkedin.com"))  return "linkedin";
-    if (url.includes("pinterest.com")) return "pinterest";
-    return "web";
+// The v1 envelope → the canonical capture object (the implementation
+// document's seam contract): `text` (a list of strings) · `image` (the
+// screenshot data-URL or null) · `media` (URL lists — `{url}` entries,
+// never bytes — the media decision) · `source_url` (or null). The
+// per-adapter extras the contract has no slot for (title / author /
+// timestamp / …) are folded into ONE text item (rework §3.1) — folded,
+// not dropped. A platform not in the map falls back to the web mapping
+// (best effort over the v1 web field names): a new platform's SAVE
+// degrades, it never crashes.
+function toCanonicalCapture(payload) {
+    const envelope = payload && typeof payload === "object" ? payload : {};
+    const mf =
+        envelope.mandatory_fields && typeof envelope.mandatory_fields === "object"
+            ? envelope.mandatory_fields
+            : {};
+    const sp =
+        envelope.platform_specific_data && typeof envelope.platform_specific_data === "object"
+            ? envelope.platform_specific_data
+            : {};
+    const platform = typeof mf.platform === "string" ? mf.platform : "web";
+
+    const canonical = {
+        text: [],
+        image: null, // the screenshot — the only byte payload the v1 envelope carries
+        media: { images: [], videos: [], audios: [] },
+        source_url: null,
+    };
+    if (typeof mf.source_url === "string" && mf.source_url.trim()) {
+        canonical.source_url = mf.source_url.trim();
+    }
+    // The universal.js CAPTURE_WEB flow is the only v1 sender with a
+    // screenshot (captureVisibleTab's data-URL); a null/blank one leaves
+    // the field absent — it is optional (the serializer's two carriers).
+    if (typeof sp.screenshot_base64 === "string" && sp.screenshot_base64.trim()) {
+        canonical.image = sp.screenshot_base64;
+    }
+    (CANONICAL_MAPPERS[platform] || mapWeb)(sp, canonical);
+    return canonical;
 }
 
-// ===========================
-// ROUTER (v1 — contract §8's territory)
-// ===========================
+// The canonical object's field builders — each filters null / blank and
+// dedupes, so the per-platform mappers can be blunt: they name the v1
+// fields, the helpers decide what is usable.
 
-// The v1 platform router — the switch body is v1 byte-identical. §3
-// renamed it (the bus handler above takes the name) and gave its crash
-// envelope the §1 `code` field; §8 (capture coordination) replaces it
-// with the canonical-capture multipart submission.
-async function routeSave(platform, payload, sendResponse) {
-    try {
-        switch (platform) {
-            case "youtube":
-                await handleYouTube(payload, sendResponse);
-                break;
-            case "twitter":
-                await handleGeneric(payload, sendResponse);
-                break;
-            case "linkedin":
-            case "pinterest":
-            case "web":
-            default:
-                await handleGeneric(payload, sendResponse);
-                break;
-        }
-    } catch (err) {
-        console.error("routeSave crashed:", err);
-        sendResponse({ status: STATUS.ERROR, code: 0, error: err.message });
+function nonBlank(value) {
+    return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function addText(canonical, value) {
+    const s = nonBlank(value);
+    if (s) canonical.text.push(s);
+}
+
+function addImage(canonical, url) {
+    const s = nonBlank(url);
+    if (s && !canonical.media.images.some((e) => e.url === s)) {
+        canonical.media.images.push({ url: s });
     }
 }
 
-// ===========================
-// CAPTURE SUBMISSION (v1 envelope — contract §8's territory)
-// ===========================
-//
-// The v1 platform router submits the v1 envelope as plain JSON through
-// the §5 shared request path (fetchJson) — the contract's "one shared
-// request path for all background features" (acceptance 1: no per-
-// feature fetch duplication; the v1 `postJSON` raw fetch it replaces
-// is gone). The §5 credential contract rides with it — credentials:
-// 'include' / Bearer per AUTH_MODE — so a SIGNED-IN user's save no
-// longer 401s (the documented "saves currently 401" bug, contract §0).
-//
-// No authentication DECISION here (the §5 boundary): a 401 is the plain
-// ERROR envelope exactly as before → the same toast as today. The
-// 401 → UNAUTHENTICATED status mapping, and the canonical four-field
-// multipart submit that replaces this v1 envelope, are §8's — and they
-// ride this same path through the FormData seam (fetchJson above).
-
-async function handleYouTube(payload, sendResponse) {
-    // YouTube was already working — plain JSON POST, no media download
-    sendResponse(await fetchJson("/captures/", { method: "POST", body: payload }));
+function addVideo(canonical, url) {
+    const s = nonBlank(url);
+    if (s && !canonical.media.videos.some((e) => e.url === s)) {
+        canonical.media.videos.push({ url: s });
+    }
 }
 
-async function handleGeneric(payload, sendResponse) {
-    sendResponse(await fetchJson("/captures/", { method: "POST", body: payload }));
+function addUrls(canonical, list, add) {
+    if (!Array.isArray(list)) return;
+    for (const item of list) add(canonical, item);
+}
+
+// One folded metadata text item from the given parts (rework §3.1: the
+// current contract has no metadata slot — folded, not dropped).
+function metaItem(...parts) {
+    return parts.map(nonBlank).filter(Boolean).join(" — ");
+}
+
+// web (universal.js — the main river): the title + author metadata block
+// folded into one item, the Readability text, the highlighted selection;
+// the lead image + embedded video as URL entries (the media decision —
+// URLs only, the backend's ingest fetches them).
+function mapWeb(sp, canonical) {
+    addText(canonical, metaItem(sp.title, sp.author ? `by ${sp.author}` : ""));
+    addText(canonical, sp.text_content);
+    addText(canonical, sp.highlighted_text);
+    addImage(canonical, sp.lead_image_url);
+    addVideo(canonical, sp.embedded_video_url);
+}
+
+// youtube: the v1 button capture is title + channel only — the
+// extension sends the link and the backend's platform handler supplies
+// the transcript + thumbnail (rework §3.1: a 1080p file would eat the
+// free-plan budget; the transcript doesn't). No media entries.
+function mapYouTube(sp, canonical) {
+    addText(canonical, metaItem(sp.title, sp.author ? `by ${sp.author}` : ""));
+}
+
+// twitter: the tweet text + the author / handle / timestamp block; the
+// images, and the video posters (HLS — no real video at scrape time),
+// as `{url}` entries, deduped — NO video entry: the backend's X handler
+// supplies the real MP4 and supersedes the scraped items (rework §3.1).
+function mapTwitter(sp, canonical) {
+    addText(canonical, metaItem(sp.authorName, sp.username, sp.timestamp));
+    addText(canonical, sp.tweetText);
+    addUrls(canonical, sp.images, addImage);
+    if (Array.isArray(sp.videos)) {
+        for (const v of sp.videos) {
+            if (v && typeof v === "object") addImage(canonical, v.poster);
+        }
+    }
+}
+
+// pinterest: the alt text + the pin image.
+function mapPinterest(sp, canonical) {
+    addText(canonical, sp.alt_text);
+    addImage(canonical, sp.image_url);
+}
+
+// linkedin: the post text + the author name / headline block; the post
+// images and the real video srcs (LinkedIn's `videos[]` are real URLs —
+// unlike the tweet's posters, which are thumbnails).
+function mapLinkedIn(sp, canonical) {
+    addText(canonical, metaItem(sp.author_name, sp.author_headline));
+    addText(canonical, sp.post_text);
+    addUrls(canonical, sp.images, addImage);
+    addUrls(canonical, sp.videos, addVideo);
+}
+
+const CANONICAL_MAPPERS = {
+    web: mapWeb,
+    youtube: mapYouTube,
+    twitter: mapTwitter,
+    pinterest: mapPinterest,
+    linkedin: mapLinkedIn,
+};
+
+// Shape validation (rule 5; acceptance 3): a capture with nothing
+// usable in any of the four fields is malformed → a structured error,
+// nothing submitted. A source_url-only capture is well-shaped (the
+// backend's origin fetch is the documented fallback for non-stored
+// items) — content QUALITY is the pipeline's judgment, not this.
+function hasUsableContent(canonical) {
+    return (
+        canonical.text.length > 0 ||
+        canonical.media.images.length > 0 ||
+        canonical.media.videos.length > 0 ||
+        canonical.media.audios.length > 0 ||
+        canonical.image !== null ||
+        canonical.source_url !== null
+    );
+}
+
+// The screenshot conversion (the repurposed v1 `downloadMedia` — its
+// v1 media-download role is retired by the media decision: the
+// extension never downloads media, URLs only, server-side fetch). The
+// CAPTURE_WEB data-URL (a data:image/jpeg;base64, string from
+// captureVisibleTab) becomes the one file part: fetch() on a data URL
+// needs no permission at all (rework finding 5), and the raw bytes are
+// ~33% lighter than the base64 string riding the form field. It is the
+// worker's one sanctioned raw fetch: a data: URL is a LOCAL conversion,
+// never a call to the SaaS origin — the §5 "one shared request path"
+// invariant (which governs backend calls) is untouched, and the actual
+// POST still rides that path (postCapture below). A failure degrades to
+// a no-screenshot capture (the field is optional) — never a failed save.
+async function screenshotToFile(dataUrl) {
+    try {
+        const response = await fetch(dataUrl);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        const blob = await response.blob();
+        const type = ((blob.type || "image/jpeg").split(";")[0]).trim().toLowerCase();
+        const name = type === "image/png" ? "screenshot.png" : "screenshot.jpg";
+        return new File([blob], name, { type });
+    } catch (err) {
+        console.error("Screenshot conversion failed:", err);
+        return null;
+    }
+}
+
+// The always-multipart assembly (contract §8 — the owner decision
+// 2026-10-23): `text` / `media` as JSON-string form fields (the same
+// objects, stringified — the backend's multipart superset parses them
+// back, serializers' create()), `source_url` as a plain string (the
+// scalar of the three — JSON-quoting it would store the quotes; the
+// backend's CharField reads the form value verbatim), and the
+// screenshot as the one file part. Absent optional fields are simply
+// not appended. No Content-Type header is ever set — the browser must
+// build the multipart boundary (fetchJson's FormData seam, §5, passes
+// the form through untouched).
+function buildCaptureForm(canonical, screenshotFile) {
+    const form = new FormData();
+    if (canonical.text.length > 0) {
+        form.append("text", JSON.stringify(canonical.text));
+    }
+    const media = {};
+    for (const kind of ["images", "videos", "audios"]) {
+        if (canonical.media[kind].length > 0) media[kind] = canonical.media[kind];
+    }
+    if (Object.keys(media).length > 0) {
+        form.append("media", JSON.stringify(media));
+    }
+    if (canonical.source_url) {
+        form.append("source_url", canonical.source_url);
+    }
+    if (screenshotFile) {
+        form.append("file:image:0", screenshotFile);
+    }
+    return form;
+}
+
+// The submission (contract §8): POST /captures/ through the §4 gate on
+// the §5 shared request path — the v1 plain-JSON capture path is
+// retired (the authenticated pipeline expects the multipart shape). The
+// §8 status mapping rides the gate's envelopes:
+//   2xx        → { status: "OK", data } — the created capture, its
+//                `status` (queued / … — the backend's vocabulary)
+//                passed through, never re-derived;
+//   401 + dead → UNAUTHENTICATED + sign_in_url = FRONTEND_ORIGIN +
+//                /login (so the content script CAN offer the sign-in
+//                page — it itself never reads storage or credentials);
+//   other HTTP → ERROR (code + the backend body passed through);
+//   network    → FETCH_ERROR.
+// The FormData body is reusable across the gate's single retry — the
+// fetch spec re-serializes a FormData per request (unlike a consumed
+// stream) — so the §4 401 recovery applies unchanged to the multipart
+// shape.
+async function postCapture(form, sendResponse) {
+    const result = await authFetch("/captures/", { method: "POST", body: form });
+
+    if (result.status === STATUS.OK) {
+        sendResponse({ status: STATUS.OK, data: result.data });
+        return;
+    }
+    // UNAUTHENTICATED / ERROR / FETCH_ERROR pass through untransformed —
+    // the §1 response envelope. The byte-identical toast renders its
+    // error panel for all of them; the sign-in-required panel that would
+    // consume the UNAUTHENTICATED sign_in_url is a later content-script
+    // task, not §8 (they stay byte-identical here).
+    sendResponse(result);
 }
 
 // ===========================
@@ -840,22 +1055,3 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     });
 });
 
-// ===========================
-// MEDIA DOWNLOADER
-// ===========================
-
-async function downloadMedia(url) {
-    try {
-        console.log("Downloading:", url);
-        const response = await fetch(url);
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        return await response.blob();
-    } catch (err) {
-        console.error("Download failed:", err);
-        return null;
-    }
-}
