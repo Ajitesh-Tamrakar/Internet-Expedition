@@ -1,5 +1,12 @@
 const BUTTON_CLASS = "my-pinterest-save-btn";
 
+// The bus message name this script speaks (contract §1 —
+// planning_docs/PopUp_Background_message_relay.md; the payload/response
+// shapes are documented there, once. No shared file by decision.)
+const MSG = {
+    SAVE: "SAVE" // → worker: the extracted pin
+};
+
 console.log("[PINTEREST-EXT] Loaded");
 
 /* ===========================
@@ -80,7 +87,7 @@ function onButtonClick(event, pin) {
 
     bmSetState(btn, "saving");
 
-    chrome.runtime.sendMessage({ type: "SAVE", data: payload }, (response) => {
+    chrome.runtime.sendMessage({ type: MSG.SAVE, data: payload }, (response) => {
         console.group("📨 Response From Background");
         console.log(response);
         if (chrome.runtime.lastError) {

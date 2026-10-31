@@ -21,9 +21,14 @@ const API_BASE_URL = "https://internetexpedition.ajiteshtamrakar.com";
 //   api_base_url  — the bare API origin; seeded on first install from the
 //                   constant above, after which only the documented
 //                   manual DevTools override writes it (no UI).
-//   access_token  — the last derived access token; PRESENCE = signed in,
-//                   absent = sign-in-required. No expiry bookkeeping, no
-//                   timers — the derive/refresh callers arrive in M4.
+//   (The second key is the session-state key. Settled Authentication
+//    contract, planning_docs/PopUp_Background_message_relay.md: PRIMARY
+//    design = "session_state" with a non-secret VALUE ("signed_in" /
+//    "signed_out" — a UI signal, never proof; no token value ever lives
+//    in storage); the documented fallback = "access_token" PRESENCE (the
+//    body-token design). The M2 accessor pair below is that fallback's
+//    half, with no callers yet; the contract's §4 (background B) lands
+//    the primary key, its callers, and the legacy-key removal.)
 let configCache = null;
 
 async function readConfig() {
@@ -46,10 +51,11 @@ async function getAccessToken() {
     return cfg.access_token || null;
 }
 
-// Presence is the state: passing null REMOVES the key (absent =
-// signed out). The storage write is what fires the
-// chrome.storage.onChanged broadcast (bus channel C2) an open popup
-// consumes. (M2 lands the accessor; its callers arrive in M4.)
+// Fallback-mode accessor (M2; no callers yet — the contract's §4 auth
+// section brings them, and lands the primary-design key instead).
+// Passing null REMOVES the key; in fallback mode presence = signed in.
+// The storage write is what fires the chrome.storage.onChanged
+// broadcast (bus channel C2) an open popup consumes.
 async function setAccessToken(token) {
     if (token) {
         await chrome.storage.local.set({ access_token: token });
@@ -61,15 +67,45 @@ async function setAccessToken(token) {
 }
 
 // ===========================
-// MESSAGE BUS (rework §1 bus block)
+// MESSAGE BUS (the bus contract — planning_docs/PopUp_Background_message_relay.md §1)
 // ===========================
 
+// The seven-message catalog (contract §1 — the message inventory; the
+// payload/response *shapes* are documented there, once). The names are
+// constants defined inline in each file that speaks them — no shared
+// file (the rework doc's no-shared-file decision, reaffirmed by the
+// contract). The worker is the bus's sole owner (contract rule 7), so
+// it carries the full catalog even though only SAVE is registered below
+// yet. No context in the extension retypes a name as a bare string.
+const MSG = {
+    SAVE:          "SAVE",          // content → worker: the capture to save
+    CAPTURE_WEB:   "CAPTURE_WEB",   // worker → content (tabs.sendMessage); fire-and-forget
+    SESSION_EVENT: "SESSION_EVENT", // relay → worker: signed-in / signed-out; fire-and-forget
+    SEARCH:        "SEARCH",        // popup → worker
+    LIBRARY:       "LIBRARY",       // popup → worker (reserved — the v1 popup sends neither it nor SIGN_OUT)
+    SIGN_OUT:      "SIGN_OUT",      // popup → worker (reserved)
+    USER:          "USER",          // popup → worker; doubles as the on-open session check
+};
+
+// The response envelope's status vocabulary (contract §1 — "Response
+// envelope": every request/response message resolves to exactly one of
+// these). The worker is the bus's sole response builder (rule 7), so the
+// vocabulary lands here; the later sections map their backend outcomes
+// onto it and never invent a new status.
+const STATUS = {
+    OK:              "OK",              // { status, …feature payload }
+    UNAUTHENTICATED: "UNAUTHENTICATED", // { status, sign_in_url } — the frontend origin's /login
+    ERROR:           "ERROR",           // { status, code, error }
+    FETCH_ERROR:     "FETCH_ERROR",     // { status, error }
+};
+
 // The small intra-file listener wrapper (rework finding 6 — no shared
-// bus.js file in v1). Rule 1: every C1 message is {type, …} and a
-// listener matches `type` first — everything else is ignored. Rule 2:
-// the handler owns the response — it runs async and calls sendResponse
+// bus file). The listener matches `type` first — an unknown type is
+// ignored (contract rule 5: boundary validation; rule 8: safe failure).
+// The handler owns the response — it runs async and calls sendResponse
 // exactly once, so the listener returns true to keep the MV3 channel
-// open until then.
+// open until then (contract rule 10 keeps event vs request lifecycles
+// explicit).
 function listen(type, handler) {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!message || message.type !== type) return false;
@@ -78,16 +114,18 @@ function listen(type, handler) {
     });
 }
 
-// M2 registers SAVE only; the rest of the seven-message catalog
-// (SESSION_EVENT / SIGN_OUT — M4; SEARCH / LIBRARY / USER — M6)
-// registers in its feature milestone, and CAPTURE_WEB is worker→content
-// (sent below, never listened). An unregistered type is ignored by rule
-// 1, so partial registration is safe.
-listen("SAVE", (message, sender, sendResponse) => {
+// SAVE is the only registered type so far (contract §1 defines the full
+// catalog above; the remaining listenable types register in the doc's §3
+// routing section, and CAPTURE_WEB is worker→content — sent in the
+// context-menu handler below, never listened). An unregistered type is
+// ignored (contract rule 5), so partial registration is safe.
+listen(MSG.SAVE, (message, sender, sendResponse) => {
     console.log("Received message in background:", message);
 
-    // Handler body stays v1-shaped in M2 — the canonical-capture
-    // redesign and the SaaS status vocabulary are M5 (impl doc §3.3).
+    // Handler body stays v1-shaped — the canonical-capture redesign and
+    // the always-multipart submission are the contract's §8 (capture
+    // coordination); the SaaS status vocabulary is §1 (the STATUS block
+    // above) and its SAVE mapping is §8's.
     const platform = detectPlatform(sender);
     console.log("Detected platform:", platform);
 
@@ -130,7 +168,7 @@ async function handleSave(platform, payload, sendResponse) {
         }
     } catch (err) {
         console.error("handleSave crashed:", err);
-        sendResponse({ status: "ERROR", error: err.message });
+        sendResponse({ status: STATUS.ERROR, error: err.message });
     }
 }
 
@@ -165,14 +203,14 @@ async function postJSON(url, payload, sendResponse) {
 
         if (response.ok) {
             console.log("JSON POST success:", data);
-            sendResponse({ status: "OK", data });
+            sendResponse({ status: STATUS.OK, data });
         } else {
             console.error("Backend error:", response.status, data);
-            sendResponse({ status: "ERROR", code: response.status, error: data });
+            sendResponse({ status: STATUS.ERROR, code: response.status, error: data });
         }
     } catch (err) {
         console.error("postJSON failed:", err);
-        sendResponse({ status: "FETCH_ERROR", error: err.message });
+        sendResponse({ status: STATUS.FETCH_ERROR, error: err.message });
     }
 }
 
@@ -222,14 +260,15 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
             dataUrl = null;
         }
         chrome.tabs.sendMessage(tab.id, {
-            type: "CAPTURE_WEB",
+            type: MSG.CAPTURE_WEB,
             selectionText: info.selectionText || null,
             screenshot_base64: dataUrl || null,
         }, () => {
-            // Bus rule 3: fire-and-forget senders void lastError — the
-            // tab may have no receiver (a dead / net-error page, or the
-            // app origin after exclude_matches) and the void keeps it a
-            // silent no-op, never a throw.
+            // Fire-and-forget sends void lastError (contract §1 —
+            // CAPTURE_WEB carries no response): the tab may have no
+            // receiver (a dead / net-error page, or the app origin after
+            // exclude_matches) and the void keeps it a silent no-op,
+            // never a throw.
             void chrome.runtime.lastError;
         });
     });

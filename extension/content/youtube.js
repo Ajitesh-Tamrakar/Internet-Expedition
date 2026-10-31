@@ -1,3 +1,10 @@
+// The bus message name this script speaks (contract §1 —
+// planning_docs/PopUp_Background_message_relay.md; the payload/response
+// shapes are documented there, once. No shared file by decision.)
+const MSG = {
+    SAVE: "SAVE" // → worker: the extracted capture
+};
+
 /* ===========================
    SAVED-STATE HELPER (shared, duplicated per content script)
 =========================== */
@@ -122,7 +129,7 @@ function injectSaveButton() {
             console.log('capturedData', data);
 
             bmSetState(newBtn, "saving");
-            chrome.runtime.sendMessage({ type: "SAVE", data }, (response) => {
+            chrome.runtime.sendMessage({ type: MSG.SAVE, data }, (response) => {
                 if (!chrome.runtime.lastError && response?.status === "OK") {
                     bmSetState(newBtn, "saved");
                     window.bmShowConfirmation(response.data?.bookmark_id);

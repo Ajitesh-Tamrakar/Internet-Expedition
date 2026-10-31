@@ -3,6 +3,13 @@ const BUTTON_CLASS = "my-linkedin-save-btn";
 const PROCESSED_ATTR = "data-linkedin-save-processed";
 const DEBUG = false;
 
+// The bus message name this script speaks (contract §1 —
+// planning_docs/PopUp_Background_message_relay.md; the payload/response
+// shapes are documented there, once. No shared file by decision.)
+const MSG = {
+    SAVE: "SAVE" // → worker: the extracted post
+};
+
 /* ===========================
    SAVED-STATE HELPER (shared, duplicated per content script)
 =========================== */
@@ -372,7 +379,7 @@ function injectButton(post, index) {
 
         bmSetState(btn, "saving");
 
-        chrome.runtime.sendMessage({ type: "SAVE", data: payload }, (response) => {
+        chrome.runtime.sendMessage({ type: MSG.SAVE, data: payload }, (response) => {
             if (DEBUG) {
                 console.group("📨 Response From Background");
                 console.log(response);

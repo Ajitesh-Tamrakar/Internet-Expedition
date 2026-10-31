@@ -238,3 +238,41 @@ First milestone where the extension **targets a real backend**: the worker now c
 **Owner decision (2026-10-26):** the two progress docs (this file + `extension_milestone_progress.md`) move from the repo root to `planning_docs/` (alongside the impl + rework plan docs) and remain **git-tracked on `cloud-migration`** — the folder stays gitignored for the local-only plan docs, with a `.gitignore` negation for the two progress docs. Also: **there is no `extension/rework` branch in this checkout** — every commit (M1 + M2) landed directly on `cloud-migration`; the `extension/rework` branch names recorded in the M1/M2 entries above were wrong and are corrected in place. The impl doc's §0.4, §2 tree, §6-21(g), §7 common-to-every-milestone, and M1 sections are amended to match, and the board's branch/flag lines updated. Docs-only session — no code touched, nothing tested that was not previously tested.
 
 **Files changed:** `planning_docs/extension_documention.md` + `planning_docs/extension_milestone_progress.md` (re-homed, `git mv` — tracked status preserved); `.gitignore` (folder-ignore → contents-ignore + two negations); `planning_docs/extension_implementation.md` (local-only — not tracked).
+
+---
+
+## Bus contract — `PopUp_Background_message_relay.md` §1 (2026-10-31)
+
+**Session:** 2026-10-31. **Branch:** `cloud-migration`. **Scope (owner directive):** the new contract doc's section 1 (message bus) only — nothing from §2 onward.
+
+### 1. Objective
+
+Land the *code footprint* of contract §1: the named message catalog and the response-envelope vocabulary as inline constants (the no-shared-file decision stands), and re-point the stale M1/M2 comments at the contract that supersedes them. No handlers, no relay, no auth, no shared request path, no popup, no backend — those are §3–§8's.
+
+### 2. What landed
+
+| File | Change |
+|---|---|
+| `extension/background.js` | Full seven-type `MSG` catalog + four-state `STATUS` envelope vocabulary (contract §1's inventory and "Response envelope"; the worker is the bus's sole owner per contract rule 7, so it carries the whole catalog though only SAVE is registered yet). Every bare `type:`/`status:` string → constant. Stale comments re-pointed: the storage block no longer implies `access_token` presence is the signed-in indicator (C2 rule — the settled contract: primary `session_state` value-key, fallback `access_token` presence); M4/M6 milestone refs → the contract's §3/§4/§8; the rework rule numbers → contract rules 5/8/10. **Storage code untouched** — the M2 `get/setAccessToken` pair (uncalled) stands until §4 flips the key |
+| `extension/content/universal.js` | Inline `MSG` with the two types it speaks (SAVE + CAPTURE_WEB); both bare strings → constants |
+| `extension/content/{youtube,twitter,pinterest,linkedin}.js` | Inline `MSG` with SAVE; the send site → constant. Payloads, response dispatch, buttons, toasts: untouched (their normalization to the four-status vocabulary is the M5/M7 remap — impl doc finding 6, not §1) |
+| **not touched** | popup stub (speaks no bus names; §10 replaces it whole), the relay (absent — §2), the LinkedIn bridge `inject.js`/`early.js` (frozen — acceptance 4), both manifests (no relay entry until §2), all backend code |
+
+### 3. Decisions
+
+- **The full catalog lives in the worker even though five types are unregistered.** §1's purpose is "the named catalog of everything that crosses a context boundary"; rule 7 makes the worker the bus's sole owner, and §3 (next step) registers the remaining five listenable types against these same constants. Content scripts carry only the types they speak — "defined inline in each file that uses them."
+- **`STATUS` lands in the worker only.** It is the sole response builder (rule 7). The v1-shaped consumer comparisons in the five content scripts + the toast core keep their literal `"OK"`/`"FETCH_ERROR"` reads for now: rewriting those dispatches (incl. the sign-in-required branch) is the M5/M7 normalization, which §8's status mapping also owns. §1's no-bare-string rule covers *message names*, and those are all constants.
+- **Storage: comment-only, by the contract's own division of labor.** §1's last bullet is explicit — "the cookie flow and the non-secret session-state representation are … settled in the Authentication contract section, and **section 4 implements them as written**." The only §1 obligation on storage is the C2 wording (acceptance 3: the key is defined in the contract; no token value in any key or message — true: the uncalled M2 accessors store nothing today, and no bus message carries a token).
+
+### 4. Verification — actual results
+
+- `node --check` on every non-vendor JS file (worker, 5 content scripts, bridge ×2, popup): **clean**.
+- **Bare-string audit:** the seven wire names now occur *only* at their constant-definition sites (6 files); no `type: "…"` literal anywhere outside `vendor/`. The constant values are byte-identical to the old wire strings — a behavior-neutral rename.
+- **Kept-line check** (all six diffs reviewed): every non-constant line is byte-identical to the committed version — the diffs are additions + renames only.
+- **LinkedIn bridge unchanged:** `inject.js` / `early.js` zero diff (acceptance 4); their `__liUrnSource` page-messaging contract is a separate use of C3 the bus does not revise. Popup stub + both manifests: zero diff.
+- **Contract acceptance 2** (documented shapes): satisfied at the contract level — the inventory + envelope + the fire-and-forget notes (CAPTURE_WEB / SESSION_EVENT) live once in the doc §1, which is the documented "one place." **Acceptance 3:** the C2 key is defined in the contract; no token value appears in any storage key or bus message.
+- **No browser smoke re-run.** M2's browser acceptance (C1–C7, all passed) covers exactly the flow this rename touches, and the rename is wire-identical — the static battery stands as the evidence; a full CDP re-run for a string rename was judged unnecessary (owner: don't go overboard).
+
+### 5. Next step (contract build order)
+
+**Step 2 — the Frontend task (the `IE-ClientSide` sync-event emitter) + the relay (§2), together.** The client landed 2026-10-30 (`3c57b56`…`25e481f`) but emits no auth events yet: new `IE-ClientSide/src/lib/authEvents.js` hooked into `authStore.js`'s `setAuthenticated`/`setUnauthenticated`, plus the new `content/relay.js` and its entries in **both** manifests (frontend origin only, `document_idle`). Note: the step-0 SameSite probe (build order) has **no recorded outcome** anywhere in these docs — it gates the *auth* sections (§4/§5, incl. the `AUTH_MODE` seam and the `session_state` key flip), not this step or the one after.

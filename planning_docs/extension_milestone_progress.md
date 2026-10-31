@@ -17,6 +17,8 @@ Milestones per `planning_docs/extension_implementation.md` §7 (M1–M8).
 | M7 | Platform adapters: four tributaries + per-item media degradation (M7a B3 → M7b) | ⬜ Not started |
 | M8 | Integration: the end-to-end flow as a repeatable regression net | ⬜ Not started |
 
+**⚠ Re-sequenced (2026-10-31) — read this before anything else.** The build now follows the section sequence of `planning_docs/PopUp_Background_message_relay.md` (the local-only contract doc; its §0 current-state is the accurate one, the M1–M8 rows above are history): step 0 (SameSite probe — **still no recorded outcome**; gates the auth sections §4/§5 only) → step 1 **bus contract §1 ✅ landed 2026-10-31** (inline `MSG` catalog + `STATUS` envelope in the worker, constants in the five content scripts; nothing else — the session log entry is the fine record) → step 2 **the `IE-ClientSide` sync-event emitter + the relay §2 (next)** → §3 routing → §5 shared request path (`AUTH_MODE` seam) → §4 auth → §6 search → §7 library/user → §8 capture → §9 integration → §10–15 popup. Also: the impl-doc M3 frontend has **landed** as `IE-ClientSide/` (full client, commits `3c57b56`…`25e481f`, 2026-10-30 — the "⬜ Not started" above is stale for M3; the M4–M8 rows are superseded by the contract's §4–§9 re-sequencing).
+
 ## 2. M1 — what landed, and the evidence
 
 Branch `cloud-migration` (base `aeaeac3`); 6 commits after the docs commit:

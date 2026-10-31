@@ -1,3 +1,11 @@
+// The bus message names this script speaks (contract §1 —
+// planning_docs/PopUp_Background_message_relay.md; the payload/response
+// shapes are documented there, once. No shared file by decision.)
+const MSG = {
+  SAVE: "SAVE",               // → worker: the extracted capture
+  CAPTURE_WEB: "CAPTURE_WEB"  // ← worker: context-menu capture request (fire-and-forget)
+};
+
 const VIDEO_EMBED_PATTERNS = [
   /youtube(-nocookie)?\.com\/embed\//,
   /player\.vimeo\.com\/video\//,
@@ -73,9 +81,9 @@ function extractWebPage(selectionText, screenshotBase64) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type !== "CAPTURE_WEB") return;
+  if (message.type !== MSG.CAPTURE_WEB) return;
   const payload = extractWebPage(message.selectionText, message.screenshot_base64);
-  chrome.runtime.sendMessage({ type: "SAVE", data: payload }, (response) => {
+  chrome.runtime.sendMessage({ type: MSG.SAVE, data: payload }, (response) => {
     if (response?.status === "OK") {
       window.bmShowConfirmation(response.data?.bookmark_id);
     } else {

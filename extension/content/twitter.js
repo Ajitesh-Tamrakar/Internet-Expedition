@@ -1,3 +1,10 @@
+// The bus message name this script speaks (contract §1 —
+// planning_docs/PopUp_Background_message_relay.md; the payload/response
+// shapes are documented there, once. No shared file by decision.)
+const MSG = {
+    SAVE: "SAVE" // → worker: the extracted tweet
+};
+
 function getOriginalImageUrl(url) {
     try {
         const parsed = new URL(url);
@@ -172,7 +179,7 @@ document.addEventListener("click", (event) => {
 
     bmSetState(button, "saving");
 
-    chrome.runtime.sendMessage({ type: "SAVE", data: payload }, (response) => {
+    chrome.runtime.sendMessage({ type: MSG.SAVE, data: payload }, (response) => {
         console.group("📨 Response From Background");
         console.log(response);
         if (chrome.runtime.lastError) {
