@@ -276,3 +276,55 @@ Land the *code footprint* of contract §1: the named message catalog and the res
 ### 5. Next step (contract build order)
 
 **Step 2 — the Frontend task (the `IE-ClientSide` sync-event emitter) + the relay (§2), together.** The client landed 2026-10-30 (`3c57b56`…`25e481f`) but emits no auth events yet: new `IE-ClientSide/src/lib/authEvents.js` hooked into `authStore.js`'s `setAuthenticated`/`setUnauthenticated`, plus the new `content/relay.js` and its entries in **both** manifests (frontend origin only, `document_idle`). Note: the step-0 SameSite probe (build order) has **no recorded outcome** anywhere in these docs — it gates the *auth* sections (§4/§5, incl. the `AUTH_MODE` seam and the `session_state` key flip), not this step or the one after.
+
+---
+
+## Sync relay — `PopUp_Background_message_relay.md` §2 (2026-10-31)
+
+**Session:** 2026-10-31. **Branch:** `cloud-migration`. **Scope (owner directive):** contract §2 only — "implement section 2, don't go overboard." The Frontend task's emitter (a separate section that the build order would normally run together with §2), §3 onward, the popup, and the backend: untouched.
+
+### 1. Objective
+
+Land contract §2: the new `content/relay.js` — a small content script registered **only on the frontend origin** in both manifests (`document_idle`, listens, injects nothing) that translates the frontend's `window.postMessage` auth events (`auth:signed-in` / `auth:signed-out`) into `SESSION_EVENT`s for the service worker. One new file + its manifest entries. No worker changes (registering `SESSION_EVENT` on the bus is §3), no frontend changes (the emitter is the Frontend task), no storage, no fetch — by the section's own boundaries.
+
+### 2. What landed
+
+| File | Change |
+|---|---|
+| `extension/content/relay.js` | New (80 lines). IIFE — every name kept out of the isolated world's shared scope (content scripts on a page run in one realm; see the finding below). One `window` `message` listener with the contract's exact gate: `event.origin === window.location.origin`, payload **exactly** `{ type: <agreed name> }` (one field; the `SESSION_EVENTS` map `"auth:signed-in"→"signed-in"` / `"auth:signed-out"→"signed-out"` is the translation *and* the validation — a name not in the map is "unrelated" by construction) → forward `{ type: "SESSION_EVENT", event }` via `chrome.runtime.sendMessage` with `lastError` voided (missing/torn-down receiver = silent no-op, never a throw; the relay never retries or replaces the worker's duties). No fetch/XHR, no `chrome.storage`, no DOM, no session decisions |
+| `extension/manifest.json` | One `content_scripts` entry, first in the array: matches the pinned SaaS origin only, `js: ["content/relay.js"]`, `run_at: "document_idle"`. The all_urls entry *excludes* that origin, so the relay is the **only** content script on the frontend app and the platform capture scripts never run there |
+| `extension/manifest.dev.json` | The dev twin: same entry on `http://localhost:5173` (the same origin its all_urls entry excludes) |
+| **not touched** | `IE-ClientSide/` (the emitter — the separate Frontend task), `background.js` (no `SESSION_EVENT` registration — that is §3; until it lands the relay's send has no receiver and voids `lastError` silently, which is the documented bridge, not a gap), the five content scripts, the LinkedIn bridge, the popup stub, `dev/manifest-dev.sh` (its sed already substitutes every occurrence of the vite origin in the manifest — the relay entry gets `IE_VITE_ORIGIN` overrides for free; the relay file carries no origin literal — it compares `e.origin` against `window.location.origin` at runtime), all backend code |
+
+### 3. Decisions
+
+- **File at `content/relay.js`** (the contract says just "relay.js"): every content script in the tree lives under `content/`, and the §1 session log had already recorded that location.
+- **IIFE, not top-level `const`** (the §1 pattern for content scripts): on the four platform origins two scripts with a top-level `const MSG` now share one isolated world and collide (finding below). The relay is the sole script on its origin so either shape would work there; the IIFE is unconditionally collision-proof and matches the tree's other self-contained listener files (`confirmation.js`, `early.js`, `inject.js`).
+- **The map is the validation** — one source of truth for the two agreed names, no second name check.
+- **No worker listener in this section** — the contract's own division of labor: §2 = the relay, §3 = bus registration, §4 = session semantics.
+- **Live acceptance via manual postMessage.** The emitter does not exist yet (Frontend task), so the page-side events were fired by the harness in the exact contract shapes. The relay's contract is origin + exact shape → forward; the emitter is its *upstream*, not part of it. The full end-to-end (emitter → relay → worker → popup) still awaits the Frontend task + §3/§4.
+
+### 4. Verification — actual results
+
+**Static (all run):**
+- `node --check content/relay.js` — clean; both manifests parse; relay entry present in each with the right origin + `document_idle`.
+- Dev-vs-prod diff audit (the M2 invariant): exactly three origin fields — `host_permissions`, the relay `matches`, the `exclude_matches` (the new relay line adds one occurrence of the per-build frontend origin; the SaaS manifest carries the pinned one, the dev twin the vite one).
+- Boundary grep on relay.js (acceptance 4): no `fetch` / `XMLHttpRequest` / `chrome.storage` / `document.` / cookie / localStorage **code** — the only hits are the comments documenting what it does not do.
+- `dev/manifest-dev.sh` re-run, standard values + an `IE_VITE_ORIGIN` override: the relay entry picks up the substitution (the script's own sanity greps pass).
+
+**Live browser (all run 2026-10-31, this machine — Brave 156.1 headless + CDP; bench: the real vite app on :5173, the dev load dir, backend :8080 *down* — irrelevant to the relay):**
+- The extension loads with the correct stable ID: the SW target is `chrome-extension://oijkpjikiabildophmlfeihojjpghmed/background.js` (the key → ID derivation intact).
+- **The relay's send wakes the MV3 service worker** — the SW target appears only after the first relayed event: the push path works even when the worker is asleep.
+- On the real vite page (`/login`), with a capturing `onMessage` listener armed in the worker via CDP (harness-side only — no shipped code touched):
+  - `auth:signed-in` → **exactly one** `SESSION_EVENT` `{event:"signed-in"}`, sender = the vite page (acceptance 1) ✅
+  - `auth:signed-out` → one more, `{event:"signed-out"}` (acceptance 2) ✅
+  - unrelated type / extra field / wrong field / string payload → **zero** forwards (acceptance 3) ✅
+  - foreign sender origin (a `data:` iframe posting into the page) → ignored (the origin check) ✅
+  - a `data:` tab (unrelated origin) → **no isolated world at all** — nothing injects, relay included (acceptance 5, "never registered broadly") ✅
+- **Environment note:** branded Google Chrome refuses `--load-extension` ("not allowed in Google Chrome, ignoring"); the smoke ran in Brave 156, as in M1/M2.
+
+**Finding (out of scope — recorded, not fixed; owner: §2 only):** the §1 commit is a **live breakage of the injected-button save flow on all four platform origins** (youtube / x / pinterest / linkedin): `universal.js` (all_urls) and the platform script both inject on those pages into the one shared isolated world, and §1 gave both a top-level `const MSG` → reproduced in the real browser on youtube.com: **`SyntaxError: Identifier 'MSG' has already been declared`** — the later-injected platform script dies at parse, so its button + SAVE send never run (v1 had no duplicated top-level declaration — verified against `origin/main`; that is why M1/M2 smokes were clean pre-§1). One-line-per-file fix (file-scoped IIFE or renamed constants); the context-menu path (universal's `CAPTURE_WEB` handler) still works. Natural landing: a hotfix or the §3 session — owner's call. The relay itself is unaffected (sole script on its origin).
+
+### 5. Next step (contract build order)
+
+The other half of step 2 — the **Frontend task's emitter** (`IE-ClientSide/src/lib/authEvents.js` + the `authStore` hook points), the relay's upstream — then step 3 (bus routing: register the six listenable types on the worker against the §1 `MSG` catalog, `SESSION_EVENT` first). Carried: the `const MSG` collision finding above.

@@ -26,6 +26,15 @@
     "content_scripts": [
         {
             "matches": [
+                "https://internetexpedition.ajiteshtamrakar.com/*"
+            ],
+            "js": [
+                "content/relay.js"
+            ],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": [
                 "<all_urls>"
             ],
             "exclude_matches": [
