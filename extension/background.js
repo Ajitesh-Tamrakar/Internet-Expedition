@@ -11,6 +11,18 @@
 // the same background.js serves both manifests.
 const API_BASE_URL = "https://internetexpedition.ajiteshtamrakar.com";
 
+// The frontend's origin — the second per-manifest constant (contract §8
+// carries its drift rule: one coordinated commit to change it, via the
+// dev/manifest-dev.sh swap; §4 lands it first). The *website* address:
+// every "open the website" action — the UNAUTHENTICATED sign_in_url, the
+// popup's Sign in, the toast's sign-in link — must use this, never
+// API_BASE_URL (the bare API server has no /login page). In the SaaS
+// build the website is same-origin with the API (one pinned domain); in
+// the dev build they are different ports, which is why it is its own
+// constant. The popup carries its own copy of the same value (it cannot
+// read this worker's variables).
+const FRONTEND_ORIGIN = "https://internetexpedition.ajiteshtamrakar.com";
+
 // The extension's only memory (rework config/storage block): exactly two
 // keys in chrome.storage.local, and this worker is the SOLE WRITER
 // (the popup is a reader + storage.onChanged listener; content scripts —
@@ -18,22 +30,27 @@ const API_BASE_URL = "https://internetexpedition.ajiteshtamrakar.com";
 // (killed when idle), so whatever must survive a restart lives here: it
 // is read once on wake and cached for the worker's lifetime — the cache
 // cannot go stale mid-lifetime because we are the sole writer.
-//   api_base_url  — the bare API origin; seeded on first install from the
-//                   constant above, after which only the documented
-//                   manual DevTools override writes it (no UI).
-//   (The second key is the session-state key. Settled Authentication
-//    contract, planning_docs/PopUp_Background_message_relay.md: PRIMARY
-//    design = "session_state" with a non-secret VALUE ("signed_in" /
-//    "signed_out" — a UI signal, never proof; no token value ever lives
-//    in storage); the documented fallback = "access_token" PRESENCE (the
-//    body-token design). The M2 accessor pair below is that fallback's
-//    half, with no callers yet; the contract's §4 (background B) lands
-//    the primary key, its callers, and the legacy-key removal.)
+//   api_base_url   — the bare API origin; seeded on first install from
+//                    the constant above, after which only the documented
+//                    manual DevTools override writes it (no UI).
+//   session_state  — the session-state key under the PRIMARY design
+//                    (AUTH_MODE "cookie" below): a non-secret VALUE
+//                    ("signed_in" / "signed_out" — the value is the
+//                    state). A cache / UI signal, never proof: the
+//                    worker re-verifies against the backend on every
+//                    SESSION_EVENT and on the popup-open check.
+//   access_token   — the session-state key under the documented
+//                    FALLBACK (AUTH_MODE "header"): the body token;
+//                    PRESENCE is the state. Retired under the primary —
+//                    onInstalled/update removes any legacy copy.
+// The mode flip is one constant + the two cookie env vars + the state
+// key name (the settled Authentication contract) — never two keys at
+// once: the cleanup below keeps the retired one out of the jar of keys.
 let configCache = null;
 
 async function readConfig() {
     if (configCache) return configCache;
-    configCache = await chrome.storage.local.get(["api_base_url", "access_token"]);
+    configCache = await chrome.storage.local.get(["api_base_url", "access_token", "session_state"]);
     return configCache;
 }
 
@@ -51,11 +68,19 @@ async function getAccessToken() {
     return cfg.access_token || null;
 }
 
-// Fallback-mode accessor (M2; no callers yet — the contract's §4 auth
-// section brings them, and lands the primary-design key instead).
-// Passing null REMOVES the key; in fallback mode presence = signed in.
-// The storage write is what fires the chrome.storage.onChanged
-// broadcast (bus channel C2) an open popup consumes.
+// Sole writer: re-read the wake cache straight from storage (the source
+// of truth) — NOT readConfig(), which would short-circuit on the still-
+// set cache and "refresh" to the very values we just changed.
+async function refreshConfigCache() {
+    configCache = await chrome.storage.local.get(["api_base_url", "access_token", "session_state"]);
+}
+
+// Fallback-mode (AUTH_MODE "header") accessor (M2; the contract's §4
+// gives it its callers). Passing null REMOVES the key; in fallback mode
+// presence = signed in. The storage write is what fires the
+// chrome.storage.onChanged broadcast (bus channel C2) an open popup
+// consumes. Under the primary design nothing writes this key except the
+// onInstalled legacy cleanup removing it.
 async function setAccessToken(token) {
     if (token) {
         await chrome.storage.local.set({ access_token: token });
@@ -63,7 +88,204 @@ async function setAccessToken(token) {
         await chrome.storage.local.remove("access_token");
     }
     // Sole writer: refresh the wake cache from storage, the source of truth.
-    configCache = await chrome.storage.local.get(["api_base_url", "access_token"]);
+    await refreshConfigCache();
+}
+
+// ===========================
+// AUTH + SESSION (contract §4 — Background B: authentication and session lifecycle)
+// ===========================
+//
+// The settled Authentication contract (planning_docs/PopUp_Background_
+// message_relay.md) defines every route, the credential mode, the state
+// key, and the 401 policy implemented here; §4 is its worker-side
+// implementation. It consumes the shared request path (fetchJson, the
+// §5 seam below) and the routing from §3; the popup owns no auth logic —
+// it renders what this worker publishes.
+//
+// Step-0 probe (the contract's gate for all auth work) — recorded 2026-10-31
+// in the progress log, outcome 200: the None+Secure token cookies set on
+// plain-HTTP localhost AND attached to a service-worker cross-site fetch,
+// so AUTH_MODE lands at the primary value and the whole positive path is
+// testable locally.
+
+// The credential mode (the contract's one-constant seam): the shared
+// request path builds every fetch per this value —
+//   "cookie" — PRIMARY, pure-cookie: credentials: 'include', and NO
+//             Authorization header ever. The access cookie (path /api/)
+//             is bridged into the header server-side; the refresh cookie
+//             (path-scoped to the tokens endpoint) is the recovery door.
+//             No token value lives anywhere in the extension.
+//   "header" — the documented FALLBACK (body-token): the worker reads
+//             data.access_token from the refresh response's body into
+//             chrome.storage and sends Authorization: Bearer (plus
+//             credentials: 'include', so the refresh cookie still rides
+//             the recovery call).
+// The agent never switches on its own judgment: the fallback's trigger
+// is a probe-passed pure-cookie *data* flow that fails in integration
+// in a way that requires changing browser cookie behavior, and the
+// switch is made explicit to the owner, who flips this constant (plus
+// the two cookie env vars — the state key follows from it). Nothing else
+// in the worker changes: both branches exist, by construction.
+const AUTH_MODE = "cookie";
+
+// The session-state values (the storage key's vocabulary under the
+// primary design — the VALUE is the state). Distinct from the bus's
+// SESSION_EVENTS values (the MESSAGE BUS section below: "signed-in" /
+// "signed-out" — the frontend's hyphenated names the relay forwards):
+// same meaning, two vocabularies, per the contract.
+const SESSION_STATES = {
+    SIGNED_IN:  "signed_in",
+    SIGNED_OUT: "signed_out",
+};
+
+// Write the session-state key — the one non-secret key's writer (the
+// contract: the worker is the sole writer; its write is the C2
+// broadcast that flips an open popup). In cookie mode the value is the
+// state; in header mode the state is the token key's PRESENCE, which
+// recoverSession writes itself — only signed-out (key removal) is
+// reachable from here. A stored value is a cache, never proof of
+// authentication: the backend check arbitrates.
+async function setSessionState(state) {
+    if (AUTH_MODE === "cookie") {
+        await chrome.storage.local.set({ session_state: state });
+    } else if (state === SESSION_STATES.SIGNED_OUT) {
+        await setAccessToken(null);
+    }
+    // Sole writer: refresh the wake cache from storage, the source of truth.
+    await refreshConfigCache();
+}
+
+// The shared request path (contract §5 — Background C). §4 lands it as
+// authentication's dependency (the build order runs §5 immediately
+// before §4); §6-§8's features consume it as they land, so no feature
+// re-implements fetch plumbing or error vocabulary.
+//
+// Owns: URL construction from the bare origin (the route-prefix gotcha —
+// auth routes under /api/auth/…, data routes at the root; every route
+// spelled in full at its call site, never appended to a path-carrying
+// base), the credential behavior for the active AUTH_MODE, response
+// parsing, and the mapping onto the §1 bus envelope (a network failure
+// → FETCH_ERROR; an HTTP error → ERROR with the backend body passed
+// through — DRF {"detail": …} or allauth {"errors": […]}; a 2xx → OK).
+// Does NOT own: authentication decisions (the 401 recovery and the
+// UNAUTHENTICATED verdict are §4, below) — a 401 here is a plain ERROR
+// envelope for whoever decides what it means.
+async function fetchJson(path, { method = "GET", body = null } = {}) {
+    const base = await getApiBaseUrl();
+    const init = { method, credentials: "include" };
+    // The credential seam: header mode attaches the stored body token.
+    // Cookie mode builds NO header — the access cookie is bridged
+    // server-side (docs/authentication.md, the AccessTokenBridge); a
+    // request with neither is simply anonymous. credentials: 'include'
+    // in BOTH modes — the refresh cookie must reach its one endpoint.
+    if (AUTH_MODE === "header") {
+        const token = await getAccessToken();
+        if (token) init.headers = { Authorization: `Bearer ${token}` };
+    }
+    if (body !== null && body !== undefined) {
+        if (typeof body !== "string") {
+            init.headers = { ...(init.headers || {}), "Content-Type": "application/json" };
+            init.body = JSON.stringify(body);
+        } else {
+            init.body = body;
+        }
+    }
+
+    let response;
+    try {
+        response = await fetch(base + path, init);
+    } catch (err) {
+        return { status: STATUS.FETCH_ERROR, error: String(err) };
+    }
+
+    // One body read, JSON if it parses: a non-JSON error page (an HTML
+    // 502) is carried as text, never a crash. No body logging — under
+    // the primary design the refresh/session responses carry a body copy
+    // of the access token, and no token value may reach the console,
+    // the bus, or storage.
+    const text = await response.text().catch(() => "");
+    let data = null;
+    try { if (text) data = JSON.parse(text); } catch { /* non-JSON */ }
+
+    if (response.ok) return { status: STATUS.OK, data };
+    return { status: STATUS.ERROR, code: response.status, error: data !== null ? data : (text || `HTTP ${response.status}`) };
+}
+
+// The session check (contract §4): the one call that decides
+// signed-in-or-not — the check that relay SESSION_EVENTs and the
+// popup-open USER (§7) both resolve to. Plain fetchJson, NOT authFetch:
+// a 401 here is the answer, not a trigger.
+//   200 with data.user → "in" · 401 → "out" (dead or expired)
+//   5xx / network → "unknown" — the backend didn't answer; callers must
+//   leave any prior state untouched (never fabricate one).
+async function checkSession() {
+    const result = await fetchJson("/api/auth/app/v1/auth/session", { method: "GET" });
+    if (result.status === STATUS.OK) return "in";
+    if (result.status === STATUS.ERROR && result.code === 401) return "out";
+    return "unknown";
+}
+
+// The recovery door (contract §4): POST tokens/refresh with an EMPTY
+// body — the refresh cookie (path-scoped to this one endpoint)
+// authenticates it; credentials: 'include' lets it ride (fetchJson).
+//   200 → a fresh access cookie minted into the jar — and, header mode
+//         only, the body's access token stored (the one token write in
+//         this file; the primary design ignores the body copy).
+//   4xx → "gone" — the session is definitively dead (stale / rotated /
+//         flushed); the backend answered, so its word is final.
+//   5xx / network → "unknown" — the backend didn't answer; nothing may
+//         be claimed, no state written.
+async function recoverSession() {
+    const result = await fetchJson("/api/auth/app/v1/tokens/refresh", { method: "POST" });
+    if (result.status === STATUS.OK) {
+        // Allauth's envelope nests the token: the body is
+        // { status, data: { access_token }, … } — fetchJson's `data` is
+        // the whole body, so the token is one level deeper.
+        if (AUTH_MODE === "header" && result.data?.data?.access_token) {
+            await setAccessToken(result.data.data.access_token);
+        }
+        return "ok";
+    }
+    if (result.status === STATUS.ERROR && result.code >= 400 && result.code < 500) return "gone";
+    return "unknown";
+}
+
+// The UNAUTHENTICATED envelope (contract §1 response envelope): the
+// session is gone. sign_in_url is the FRONTEND origin's /login — never
+// the API origin (the bare API server has no /login page).
+function unauthenticated() {
+    return { status: STATUS.UNAUTHENTICATED, sign_in_url: FRONTEND_ORIGIN + "/login" };
+}
+
+// The single gate every authenticated data call goes through (contract
+// §4 Recovery): a 401 → at most one recovery → at most one retry. Never
+// a loop. Outcomes:
+//   2xx / non-401 error → passed through as fetchJson gave it.
+//   401 → recovery "gone" (a definitive 4xx from the refresh): write
+//     signed_out (the C2 broadcast flips an open popup) and report
+//     UNAUTHENTICATED with the sign-in URL.
+//   401 → recovery "ok": one retry of the original call; a still-401
+//     retry means the session died in the gap — same signed-out verdict.
+//   401 → recovery "unknown" (the refresh never reached the backend):
+//     the session is unverifiable — the original result passes through
+//     with NO state write; the next check arbitrates.
+async function authFetch(path, options = {}) {
+    let result = await fetchJson(path, options);
+    if (!(result.status === STATUS.ERROR && result.code === 401)) return result;
+
+    const recovery = await recoverSession();
+    if (recovery === "gone") {
+        await setSessionState(SESSION_STATES.SIGNED_OUT);
+        return unauthenticated();
+    }
+    if (recovery !== "ok") return result;
+
+    result = await fetchJson(path, options); // the one retry
+    if (result.status === STATUS.ERROR && result.code === 401) {
+        await setSessionState(SESSION_STATES.SIGNED_OUT);
+        return unauthenticated();
+    }
+    return result;
 }
 
 // ===========================
@@ -262,18 +484,43 @@ function handleSave(message, sender, sendResponse) {
 }
 
 // SESSION_EVENT — relay → worker (fire-and-forget; the sender is
-// contract §2). Contract §4 owns the session semantics — the backend
-// check, the one-401 recovery, the session_state write — and replaces
-// this body when it lands. Until then: validate, then no-op. The
-// events are idempotent notifications, so a no-op loses nothing — the
-// worker's next session check arbitrates (contract §9). Never responds
-// (rule 10).
-function handleSessionEvent(message, _sender, _sendResponse) {
+// contract §2). Contract §4 owns the session semantics: the event is a
+// notification, never proof — the backend arbitrates, and its answer is
+// the session-state write (whose C2 broadcast flips an open popup). The
+// events are idempotent, so duplicates and out-of-order delivery
+// converge: every handling re-verifies against the backend. Never
+// responds (rule 10); a failure is logged, never thrown at the bus.
+async function handleSessionEvent(message, _sender, _sendResponse) {
     if (!Object.values(SESSION_EVENTS).includes(message.event)) {
         console.warn(`SESSION_EVENT with unknown event value — ignored: ${String(message.event)}`);
         return;
     }
-    console.log(`SESSION_EVENT: ${message.event} — session semantics land in contract §4 (no-op until then)`);
+    if (message.event === SESSION_EVENTS.SIGNED_OUT) {
+        // The frontend KNOWS it logged out (its own DELETE) — that is
+        // authoritative: write immediately. The jar may still live (a
+        // kill can race the event); the worker's next check arbitrates,
+        // so no reverse channel is needed (the contract closes that
+        // open item).
+        await setSessionState(SESSION_STATES.SIGNED_OUT);
+        return;
+    }
+    // signed-in: re-verify — the event is not proof, the backend's
+    // answer is the state.
+    const check = await checkSession();
+    if (check === "in") {
+        await setSessionState(SESSION_STATES.SIGNED_IN);
+    } else if (check === "out") {
+        // The backend says the session is dead — one recovery (an
+        // expired access with a live refresh resurrects it), and its
+        // outcome is the state. (A recovery "unknown" here can only be
+        // a 5xx — the check just reached the backend — so signed_out is
+        // the honest state either way.)
+        const recovery = await recoverSession();
+        await setSessionState(recovery === "ok" ? SESSION_STATES.SIGNED_IN : SESSION_STATES.SIGNED_OUT);
+    }
+    // check === "unknown" (5xx / network): no state write — a stale
+    // cache beats a fabricated one; the next event or the popup-open
+    // check re-verifies (contract §9).
 }
 
 // SEARCH — popup → worker (request/response). Contract §6 owns the
@@ -300,13 +547,56 @@ function handleLibrary(_message, _sender, sendResponse) {
     sendResponse({ status: STATUS.ERROR, code: 0, error: "LIBRARY is not implemented yet (contract §7)" });
 }
 
-// SIGN_OUT — popup → worker (request/response; reserved). Contract §4
-// owns the operation (DELETE /auth/session — a 401-after-flush is
-// success — then the session_state write). Its documented payload is
-// {} — no required fields. Until §4 lands: the code-0 stub.
-function handleSignOut(_message, _sender, sendResponse) {
-    // §4's operation (the session teardown) lands here.
-    sendResponse({ status: STATUS.ERROR, code: 0, error: "SIGN_OUT is not implemented yet (contract §4)" });
+// SIGN_OUT — popup → worker (request/response; reserved — the v1 popup
+// sends neither it nor LIBRARY, contract §1). Contract §4 owns the
+// operation: DELETE auth/session — a 401-after-flush is success — then
+// the session-state write. Documented payload {} — no required fields.
+async function handleSignOut(_message, _sender, sendResponse) {
+    let result = await fetchJson("/api/auth/app/v1/auth/session", { method: "DELETE" });
+
+    // A 2xx confirms the flush. A 401 is the contract's success (allauth
+    // flushes the session and THEN answers 401 — docs/authentication.md)
+    // — but it is ambiguous: an EXPIRED access credential 401s without
+    // flushing, and the session (the live refresh cookie) would still
+    // stand, so "success" would be a lie the next derive undoes.
+    // Disambiguate exactly as authFetch does — one recovery, one retry:
+    //   recovery "gone"   → the backend says the session is already dead:
+    //                       the sign-out goal is met by definition.
+    //   recovery "ok"     → the retry rides the fresh credential; its
+    //                       2xx/401 is the real flush.
+    //   recovery "unknown"→ the refresh never reached the backend — the
+    //                       flush is unverifiable: keep the original 401
+    //                       as the answer (a structured error), write no
+    //                       state, claim no success (acceptance 4).
+    let flushConfirmed = result.status === STATUS.OK;
+    if (!flushConfirmed && result.status === STATUS.ERROR && result.code === 401) {
+        const recovery = await recoverSession();
+        if (recovery === "gone") {
+            flushConfirmed = true;
+        } else if (recovery === "ok") {
+            const retry = await fetchJson("/api/auth/app/v1/auth/session", { method: "DELETE" });
+            result = retry;
+            // The retry's HTTP status is the envelope's `code` (its
+            // `status` is the bus vocabulary): a 2xx or the
+            // 401-after-flush confirms the real flush.
+            flushConfirmed = retry.status === STATUS.OK || (retry.status === STATUS.ERROR && retry.code === 401);
+        }
+    }
+
+    if (!flushConfirmed) {
+        // No confirmed flush: pass the original result through — the
+        // 401 / 5xx / FETCH_ERROR as a structured error. State
+        // unchanged, no success claimed.
+        sendResponse(result);
+        return;
+    }
+
+    // The flush is real: both token cookies are cleared by the backend,
+    // so nothing can resurrect the session. Write the state — the C2
+    // broadcast flips an open popup (and, header mode, removes the
+    // stored token).
+    await setSessionState(SESSION_STATES.SIGNED_OUT);
+    sendResponse({ status: STATUS.OK });
 }
 
 // USER — popup → worker (request/response). Contract §7 owns the
@@ -423,6 +713,15 @@ chrome.runtime.onInstalled.addListener(async () => {
     // fallback, so a read racing this write resolves identically either
     // way — no behavior race.)
     configCache = null;
+
+    // Legacy-key cleanup (the settled Authentication contract): under
+    // the primary design no token value ever lives in storage — the
+    // access_token key is retired, so remove any copy a pre-§4 build
+    // left behind. Mode-gated: in the fallback the key is the live
+    // state key and must survive.
+    if (AUTH_MODE === "cookie") {
+        await chrome.storage.local.remove("access_token");
+    }
 
     chrome.contextMenus.create({
         id:       "bookmark-save-web",

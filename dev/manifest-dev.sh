@@ -61,19 +61,29 @@ sed_inplace() {
 # Substitute the standard local origins with the configured values.
 #   $OUT/manifest.json: the backend origin (host_permissions) and the
 #                       vite origin (the all_urls exclude_matches).
-#   $OUT/background.js: the API_BASE_URL constant (the production
-#                       origin, so it always becomes the local one).
+#   $OUT/background.js: the two per-manifest origin CONSTANTS — both
+#                       carry the production origin in the committed
+#                       file, and they must NOT converge locally (in dev
+#                       the API and the website are on different ports):
+#                       API_BASE_URL → the local backend origin,
+#                       FRONTEND_ORIGIN → the local vite origin. Line
+#                       addressing keeps the two substitutions apart.
 sed_inplace \
     -e "s|$STD_API_ORIGIN|$API_ORIGIN|g" \
     -e "s|$STD_VITE_ORIGIN|$VITE_ORIGIN|g" \
     "$OUT/manifest.json"
 sed_inplace \
-    -e "s|$PROD_ORIGIN|$API_ORIGIN|g" \
+    -e "/^const API_BASE_URL/s|$PROD_ORIGIN|$API_ORIGIN|" \
+    -e "/^const FRONTEND_ORIGIN/s|$PROD_ORIGIN|$VITE_ORIGIN|" \
     "$OUT/background.js"
 
 # Sanity: the load dir must now carry the local origins.
 grep -q "$API_ORIGIN" "$OUT/background.js" || {
     echo "error: $OUT/background.js does not carry $API_ORIGIN after substitution" >&2
+    exit 1
+}
+grep -q "$VITE_ORIGIN" "$OUT/background.js" || {
+    echo "error: $OUT/background.js does not carry $VITE_ORIGIN after substitution" >&2
     exit 1
 }
 grep -q "$API_ORIGIN" "$OUT/manifest.json" || {
