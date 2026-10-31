@@ -28,9 +28,16 @@ class CaptureViewSet(ModelViewSet):
     http_method_names = ["get", "post"]
     permission_classes = [IsAuthenticated]
     serializer_class = CaptureSerializer
+    # Newest-first library rows (the contract's B1 completion, §7): the
+    # GET /captures/ list is the extension's LIBRARY route — the newest
+    # saves at the top. Applied in get_queryset (not the class `ordering`
+    # attribute): DRF only consumes that attribute through a filter
+    # backend, and REST_FRAMEWORK configures none — the attribute alone
+    # would be a silent no-op.
+    ordering = ["-created_at"]
 
     def get_queryset(self):
-        return Capture.objects.filter(user=self.request.user)
+        return Capture.objects.filter(user=self.request.user).order_by(*self.ordering)
 
     def perform_create(self, serializer):
         capture = serializer.save(user=self.request.user)

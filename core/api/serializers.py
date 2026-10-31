@@ -536,13 +536,16 @@ class ChunkSerializer(serializers.Serializer):
 class SearchResultSerializer(serializers.Serializer):
     """A search hit: one capture, ranked, carrying all of its chunks
     (best-first). `score` is the capture's best-chunk cosine similarity
-    (higher = more relevant; not a percentage)."""
+    (higher = more relevant; not a percentage). `source_url` is the
+    capture's origin URL (the contract's B1 completion, §7 — a clickable
+    search row); None for captures with no page behind them (raw pastes)."""
 
     capture_id = serializers.UUIDField()
     rank = serializers.IntegerField()
     score = serializers.FloatField()
     summary_text = serializers.CharField(allow_null=True)
     created_at = serializers.DateTimeField(allow_null=True)
+    source_url = serializers.CharField(allow_null=True)
     chunks = ChunkSerializer(many=True)
 
 

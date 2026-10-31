@@ -973,6 +973,36 @@ class CaptureApiAutomationTests(APITestCase):
         response = self.client.get(f"/captures/{other.capture_id}/")
         self.assertEqual(response.status_code, 404)
 
+    def test_get_captures_is_newest_first(self):
+        # B1 completion (contract §7): the list route orders newest-first
+        # — the extension's LIBRARY rows. Timestamps are set explicitly:
+        # auto_now_add would make three rapid creates near-identical.
+        oldest = Capture.objects.create(user=self.user_a)
+        middle = Capture.objects.create(user=self.user_a)
+        newest = Capture.objects.create(user=self.user_a)
+        other = Capture.objects.create(user=self.user_b)
+        now = timezone.now()
+        Capture.objects.filter(pk=oldest.pk).update(
+            created_at=now - timedelta(hours=2)
+        )
+        Capture.objects.filter(pk=middle.pk).update(
+            created_at=now - timedelta(hours=1)
+        )
+        Capture.objects.filter(pk=newest.pk).update(created_at=now)
+        self.client.force_authenticate(self.user_a)
+        response = self.client.get("/captures/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [cap["capture_id"] for cap in response.data],
+            [
+                str(newest.capture_id),
+                str(middle.capture_id),
+                str(oldest.capture_id),
+            ],
+        )
+        # Isolation still holds on the list: the other user's row is out.
+        self.assertNotIn(str(other.capture_id), [c["capture_id"] for c in response.data])
+
 
 class CaptureSourceMetadataTests(TestCase):
     """Section 1 (B1 + B2): source_url + metadata on Capture, model level.
@@ -2052,7 +2082,9 @@ class SearchHelperTests(TestCase):
         #   [0.3,0.4,0,0] → 0.6
         #   [0,1,0,0]   → 0.0
 
-        self.capture_a = Capture.objects.create(user=self.user)
+        self.capture_a = Capture.objects.create(
+            user=self.user, source_url="https://example.com/article"
+        )
         CaptureContext.objects.create(
             user=self.user,
             capture_id=self.capture_a,
@@ -2150,6 +2182,10 @@ class SearchHelperTests(TestCase):
         self.assertEqual(a["summary_text"], "A page about red trucks")
         self.assertIsNotNone(a["created_at"])
         self.assertIsNone(b["summary_text"])  # context without a summary
+        # The capture's origin URL (the B1 completion): round-trips when
+        # present, None for the capture without a page behind it.
+        self.assertEqual(a["source_url"], "https://example.com/article")
+        self.assertIsNone(b["source_url"])
 
     def test_chunk_text_is_a_preview(self):
         results, _ = self._search()
@@ -2246,6 +2282,7 @@ class SearchApiTests(APITestCase):
                 "score": 0.87,
                 "summary_text": "a page about red trucks",
                 "created_at": timezone.now(),
+                "source_url": "https://example.com/article",
                 "chunks": [
                     {
                         "source_key": "summary:global:0",
@@ -2271,6 +2308,7 @@ class SearchApiTests(APITestCase):
         self.assertEqual(hit["rank"], 1)
         self.assertAlmostEqual(hit["score"], 0.87)
         self.assertEqual(hit["summary_text"], "a page about red trucks")
+        self.assertEqual(hit["source_url"], "https://example.com/article")
         self.assertEqual(hit["chunks"][0]["source_key"], "summary:global:0")
         # The vector never leaves the DB — not in the response either.
         self.assertNotIn("embedding", hit)

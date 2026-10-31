@@ -577,11 +577,34 @@ async function handleSearch(message, _sender, sendResponse) {
 
 // LIBRARY — popup → worker (request/response; reserved — the v1 popup
 // sends neither it nor SIGN_OUT, contract §1). Contract §7 owns the
-// operation (GET /captures/). Its documented payload is {} — no
-// required fields to validate. Until §7 lands: the code-0 stub.
-function handleLibrary(_message, _sender, sendResponse) {
-    // §7's operation (the capture list) lands here.
-    sendResponse({ status: STATUS.ERROR, code: 0, error: "LIBRARY is not implemented yet (contract §7)" });
+// operation: GET /captures/ — the user's capture list, newest-first (the
+// B1 completion the contract lands with §7) — through the §4 gate on
+// the §5 shared request path. Its documented payload is {} — no required
+// fields to validate.
+async function handleLibrary(_message, _sender, sendResponse) {
+    // The pinned route (§7): the capture list at the root, through
+    // authFetch — the §4 gate (a 401 → one recovery → one retry; a dead
+    // session is UNAUTHENTICATED + the frontend sign-in URL, with the
+    // signed_out write the gate performs) on the §5 shared path (the
+    // active AUTH_MODE's credential behavior).
+    const result = await authFetch("/captures/");
+
+    // Every non-OK envelope passes through untransformed — UNAUTHENTICATED,
+    // ERROR (the backend body as-is), FETCH_ERROR (network) — and when the
+    // request fails NO library data is fabricated (§7: never present an
+    // invented list on a failure).
+    if (result.status !== STATUS.OK) {
+        sendResponse(result);
+        return;
+    }
+
+    // A 200's body is the capture list itself (a ModelViewSet list
+    // without pagination returns a bare JSON array, like §6's search 200):
+    // the backend's capture objects pass through untransformed (the source
+    // lists are stripped server-side). A 200 whose body is somehow not a
+    // JSON array (a misbehaving proxy) degrades to an empty list — never a
+    // crash; "no captures" is a real answer, and a reopen re-queries.
+    sendResponse({ status: STATUS.OK, captures: Array.isArray(result.data) ? result.data : [] });
 }
 
 // SIGN_OUT — popup → worker (request/response; reserved — the v1 popup
@@ -637,13 +660,45 @@ async function handleSignOut(_message, _sender, sendResponse) {
 }
 
 // USER — popup → worker (request/response). Contract §7 owns the
-// operation (the session route's data.user, passed through), which
-// doubles as the popup's on-open session check (contract §4's
-// semantics, §7's route). Its documented payload is {} — no required
-// fields. Until §7 lands: the code-0 stub.
-function handleUser(_message, _sender, sendResponse) {
-    // §7's operation (the user details) lands here.
-    sendResponse({ status: STATUS.ERROR, code: 0, error: "USER is not implemented yet (contract §7)" });
+// operation: GET /api/auth/app/v1/auth/session — the same route the §4
+// session check uses — whose data.user payload IS the user details,
+// passed through. The response doubles as the popup's on-open session
+// check (contract: §4 owns the semantics, §7 owns the route — no eighth
+// message type). Its documented payload is {} — no required fields; the
+// identity comes from the backend's answer, never from a locally stored
+// token (the contract's "must not infer identity").
+async function handleUser(_message, _sender, sendResponse) {
+    // The pinned route (§7): the session route through authFetch — the
+    // §4 on-open semantics: a 200 proves the session live; a 401 gets
+    // one recovery, one retry; a definitively dead session comes back
+    // UNAUTHENTICATED + the frontend sign-in URL, with the signed_out
+    // write the gate performs.
+    const result = await authFetch("/api/auth/app/v1/auth/session", { method: "GET" });
+
+    if (result.status !== STATUS.OK) {
+        // 401-with-failed-recovery arrives here already UNAUTHENTICATED
+        // (the gate wrote signed_out); 5xx / network arrive as ERROR /
+        // FETCH_ERROR with NO state write — the backend didn't answer, so
+        // no state is claimed: the stored value stands, the next check
+        // arbitrates (§4's "unknown" handling, mirrored for the route).
+        sendResponse(result);
+        return;
+    }
+
+    // 200 = signed in: the worker re-verified against the backend on
+    // popup open (the contract's rule: a stored value is a cache, the
+    // backend check arbitrates on popup open) — so the state key follows
+    // the backend's answer; the write is the C2 broadcast that keeps an
+    // open popup in step.
+    await setSessionState(SESSION_STATES.SIGNED_IN);
+
+    // Allauth's envelope nests the user: the body is
+    // { status, data: { user }, … } — fetchJson's `data` is the whole
+    // body, so the details are two levels down (the same nesting the
+    // frontend reads: result.body?.data?.user). A 200 with no user in
+    // the body (a backend contract violation) degrades to null — never a
+    // crash, never an invented identity.
+    sendResponse({ status: STATUS.OK, user: result.data?.data?.user ?? null });
 }
 
 // ===========================

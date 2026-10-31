@@ -54,6 +54,8 @@ def search_captures(
                     (1 = same direction, 0 = unrelated; higher = better)
       summary_text— the capture's context summary (None if absent)
       created_at  — when the capture was saved
+      source_url  — the capture's origin URL (None for raw pastes) —
+                    a clickable search row
       chunks      — all of the capture's embedding rows, each with its
                     own score and a text preview, best-first
 
@@ -136,5 +138,8 @@ def search_captures(
         r["rank"] = rank
         r["summary_text"] = context.summary_text if context else None
         r["created_at"] = capture.created_at if capture else None
+        # None for captures with no page behind them (raw pastes); the
+        # serializer passes it through (allow_null).
+        r["source_url"] = capture.source_url if capture else None
 
     return results
