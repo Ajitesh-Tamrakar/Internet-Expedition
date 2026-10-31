@@ -182,7 +182,19 @@ async function fetchJson(path, { method = "GET", body = null } = {}) {
         const token = await getAccessToken();
         if (token) init.headers = { Authorization: `Bearer ${token}` };
     }
-    if (body !== null && body !== undefined) {
+    // Body dispatch — every shape the contract's call sites use:
+    //   FormData → passed through UNTOUCHED, with NO Content-Type header —
+    //              the browser must build the multipart boundary (§8's
+    //              always-multipart capture submit rides this seam; the
+    //              worker never sets Content-Type itself).
+    //   object   → JSON-stringified + the JSON content type (the v1
+    //              capture envelope, the auth calls).
+    //   string   → the raw body exactly as given (a call site that
+    //              pre-built it).
+    //   null/undefined → no body (the GETs, the empty-body refresh POST).
+    if (typeof FormData !== "undefined" && body instanceof FormData) {
+        init.body = body;
+    } else if (body !== null && body !== undefined) {
         if (typeof body !== "string") {
             init.headers = { ...(init.headers || {}), "Content-Type": "application/json" };
             init.body = JSON.stringify(body);
@@ -653,45 +665,30 @@ async function routeSave(platform, payload, sendResponse) {
 }
 
 // ===========================
-// CAPTURE SUBMISSION (v1 — contract §8's territory)
+// CAPTURE SUBMISSION (v1 envelope — contract §8's territory)
 // ===========================
+//
+// The v1 platform router submits the v1 envelope as plain JSON through
+// the §5 shared request path (fetchJson) — the contract's "one shared
+// request path for all background features" (acceptance 1: no per-
+// feature fetch duplication; the v1 `postJSON` raw fetch it replaces
+// is gone). The §5 credential contract rides with it — credentials:
+// 'include' / Bearer per AUTH_MODE — so a SIGNED-IN user's save no
+// longer 401s (the documented "saves currently 401" bug, contract §0).
+//
+// No authentication DECISION here (the §5 boundary): a 401 is the plain
+// ERROR envelope exactly as before → the same toast as today. The
+// 401 → UNAUTHENTICATED status mapping, and the canonical four-field
+// multipart submit that replaces this v1 envelope, are §8's — and they
+// ride this same path through the FormData seam (fetchJson above).
 
 async function handleYouTube(payload, sendResponse) {
     // YouTube was already working — plain JSON POST, no media download
-    const base = await getApiBaseUrl();
-    await postJSON(`${base}/captures/`, payload, sendResponse);
+    sendResponse(await fetchJson("/captures/", { method: "POST", body: payload }));
 }
 
 async function handleGeneric(payload, sendResponse) {
-    const base = await getApiBaseUrl();
-    await postJSON(`${base}/captures/`, payload, sendResponse);
-}
-
-// ===========================
-// FETCH HELPERS (v1 — contract §5/§8 replace it)
-// ===========================
-
-async function postJSON(url, payload, sendResponse) {
-    try {
-        const response = await fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-        });
-
-        const data = await response.json();
-
-        if (response.ok) {
-            console.log("JSON POST success:", data);
-            sendResponse({ status: STATUS.OK, data });
-        } else {
-            console.error("Backend error:", response.status, data);
-            sendResponse({ status: STATUS.ERROR, code: response.status, error: data });
-        }
-    } catch (err) {
-        console.error("postJSON failed:", err);
-        sendResponse({ status: STATUS.FETCH_ERROR, error: err.message });
-    }
+    sendResponse(await fetchJson("/captures/", { method: "POST", body: payload }));
 }
 
 // ===========================
