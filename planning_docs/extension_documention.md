@@ -328,3 +328,53 @@ Land contract §2: the new `content/relay.js` — a small content script registe
 ### 5. Next step (contract build order)
 
 The other half of step 2 — the **Frontend task's emitter** (`IE-ClientSide/src/lib/authEvents.js` + the `authStore` hook points), the relay's upstream — then step 3 (bus routing: register the six listenable types on the worker against the §1 `MSG` catalog, `SESSION_EVENT` first). Carried: the `const MSG` collision finding above.
+
+---
+
+## Bus routing — `PopUp_Background_message_relay.md` §3 (2026-10-31)
+
+**Session:** 2026-10-31. **Branch:** `cloud-migration`. **Scope (owner directive):** contract §3 (Background A — message handling and routing) only, "don't go overboard": no §4+ operations, no relay / Frontend-task / content-script / manifest / backend / popup changes. The §1 `const MSG` collision stays the owner's call and is untouched (board §6); the step-0 SameSite probe is not gated by this step (it gates §4/§5 only).
+
+### 1. Objective
+
+The worker's §3 foundation: one message listener for the whole bus, all six listenable types registered, each routed to a dedicated handler with required-field validation and the safe-failure envelope — so §4–§8 land their operations against a stable routing seam.
+
+### 2. What landed
+
+| File | Change |
+|---|---|
+| `extension/background.js` | (a) `SESSION_EVENTS` vocabulary block — the two `event` values, the worker side of the relay's map. (b) Routing foundation: **one** `chrome.runtime.onMessage` listener dispatching to `requestHandlers` / `notificationHandlers` maps. The §1 `listen(type, handler)` wrapper is kept as the registration API (now map-into + one shared dispatcher, instead of one listener per type — the §3 "a single listener registers all six" wording mandates it); a `notify(type, handler)` sibling carries the fire-and-forget lifecycle (rule 10: channel never held open, handler never responds). `runRequestHandler` is the safe-failure guarantee (rule 8): a sync throw or a rejected promise resolves to the code-0 ERROR envelope, and the exactly-once `respond` wrapper means no double-respond. `runNotifyHandler` contains throws/rejections but never responds. (c) All six listenable types registered at startup: `SAVE`, `SESSION_EVENT` (notify), `SEARCH`, `LIBRARY`, `SIGN_OUT`, `USER` — `CAPTURE_WEB` remains send-only (the context menu). (d) Six dedicated handlers, uniform `(message, sender, sendResponse)` signature: **SAVE** = the v1 body reshaped onto the bus triple + a `data`-payload validation (the canonical four-field shape is still §8's); **SESSION_EVENT** = validation + no-op (the §4 session semantics replace the body); **SEARCH** = non-blank-`q` validation + code-0 stub (§6); **LIBRARY** / **SIGN_OUT** / **USER** = code-0 stubs (§7 / §4 / §7 own the operations; the documented payloads are `{}` — no required fields). (e) The v1 router `handleSave` renamed `routeSave` (the bus handler takes the name) — switch body byte-identical; its crash envelope gains the §1 `code: 0`. The v1 sections (`detectPlatform` / router / adapters / `postJSON`) get banner annotations as §5/§8's territory. Storage accessors, context menu, `downloadMedia`: untouched. |
+| `planning_docs/extension_milestone_progress.md` | the re-sequenced line: §3 ✅ landed, next = the Frontend-task emitter + §5; the board §6 MSG-collision line: still the owner's call (landed without it per this session's scope) |
+| `extension/.dev-load/` (gitignored) | rebuilt via `dev/manifest-dev.sh` so the browser load dir carries the new worker |
+
+### 3. Decisions
+
+- **Single-listener dispatcher** — the §3 wording ("a single `chrome.runtime.onMessage` listener registers all six") can't be met by the §1 per-type wrapper, so `listen()` keeps its call-site shape but registers into maps served by one dispatcher. The event-vs-request distinction (rule 10) is explicit at the registration site (`listen` vs `notify`), not hidden in handler bodies.
+- **Stubs, not fakes.** The four operations without a landed section resolve to a code-0 ERROR naming the owning contract section — never a claimed success (rule 8), never a silent no-op on a request (the popup must be able to recover and retry — the §6/§9 failure shape). No live consumer exists yet (the v1 popup stub speaks no bus names), so the stubs regress nothing.
+- **The relay's `SESSION_EVENT` now has a receiver** — the §2 log's "no receiver, voided `lastError` silently" bridge is closed. The no-op body is the documented interim: the events are idempotent and the worker's next session check (the §4 `USER` doubling) arbitrates. The relay itself is unchanged and its §2 smoke still stands (its callback voids `lastError` either way).
+- **Validation at §3, operations at the owning section** — the seam for §4/§6/§7/§8 is the marked stub line inside each handler, not the validation and not the registration.
+- **The `routeSave` crash envelope gains `code: 0`** — the §1 ERROR envelope is `{status, code, error}`; the crash path is a worker-side failure with no HTTP status, and `code: 0` is the contract's documented value for exactly that class. Additive for consumers (the toast readers pass the whole response through).
+- **No browser smoke this session** — the node dispatch harness (below) drives the *real* listener, which is the stronger test for routing logic; the live SAVE flow's downstream (platform router → `postJSON` → toast) is byte-identical to what M2's browser acceptance verified, and the relay smoke (§2) is unaffected. Recorded rather than claimed away.
+- **Content scripts untouched** — the §1 `const MSG` collision (the injected-button breakage on the four platform origins) is the owner's documented call; "implement section 3 only" kept it out of this session. Board §6.
+
+### 4. Verification — actual results
+
+**Static (all run):**
+- `node --check extension/background.js` — clean.
+- Registration audit: exactly six registrations (five `listen` + one `notify`), all against the §1 `MSG` constants; `CAPTURE_WEB` occurs only at its constant definition, the context-menu send site, and comments — never registered.
+- Kept-line review (full `git diff`, +222/−32): every untouched v1/M2 line byte-identical — the only v1 *line* changes are the `routeSave` rename, its crash `code: 0`, and four banner annotations; the v1 console sequence for a SAVE (`Received message in background` → `Detected platform: web`) is preserved.
+
+**Dispatch harness (all run 2026-10-31 — node 22, a throwaway chrome-stub harness at `/tmp/opencode/ie-s3/dispatch-test.js` driving the real listener; backend `:8080` down, so the live SAVE lands the documented `FETCH_ERROR` branch): 33/33 checks passed**, covering:
+- the single-listener structure (exactly one `onMessage` listener; the `onInstalled` / `onClicked` registrations intact);
+- each of the six listenable types routes to its dedicated handler — `SAVE` (valid v1 envelope → `FETCH_ERROR`, exactly one response, channel held; the youtube platform branch; three malformed variants → code-0 ERROR naming `data`), `SEARCH` (valid `q` → stub; missing / blank / non-string `q` → the validation error), `LIBRARY` / `SIGN_OUT` / `USER` (→ their stubs), `SESSION_EVENT` (both values → **no** response, channel not held, acknowledged; unknown / missing `event` → safely ignored with a warn);
+- unknown type, the `{}` keepalive, `null`, and a non-object message → ignored: no response, no crash, no console noise (the M2 keepalive behavior preserved);
+- the dispatcher's safe-failure machinery, via test-only handlers appended inside the eval (never shipped): a rejected promise → code-0 ERROR, a sync throw → code-0 ERROR, a double-responding handler → exactly one response;
+- `chrome.storage.local` untouched by routing (still exactly `api_base_url`).
+
+`dev/manifest-dev.sh` re-run: load dir rebuilt, the script's own origin sanity greps passed.
+
+### 5. Next step (contract build order)
+
+- **The Frontend task's emitter** (`IE-ClientSide`) — the other half of step 2; the relay is live but its upstream still emits nothing, so the push fast path can't fire until it lands.
+- Then **§5** (the shared backend request path, the `AUTH_MODE` seam) — gated on the **step-0 SameSite probe, which still has no recorded outcome** (it gates §4/§5 only; §3 landed probe-independent). The owner runs it on the dev bench and the outcome is recorded verbatim in the log before §4/§5.
+- Carried: the §1 `const MSG` collision (one-line-per-file fix in the five content scripts — the owner's call).
