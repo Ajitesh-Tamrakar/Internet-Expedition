@@ -536,18 +536,43 @@ async function handleSessionEvent(message, _sender, _sendResponse) {
 }
 
 // SEARCH — popup → worker (request/response). Contract §6 owns the
-// operation (GET /search/?q= through the §5 shared request path). §3
-// owns the validation: the query must be a non-blank string, so the
-// backend never sees an empty ?q= (its 400). Until §6 lands the
-// operation is the code-0 stub.
-function handleSearch(message, _sender, sendResponse) {
+// operation (GET /search/?q= through the §4 gate on the §5 shared
+// request path). §3 owns the validation: the query must be a non-blank
+// string, so the backend never sees an empty ?q= (its 400).
+async function handleSearch(message, _sender, sendResponse) {
     const q = typeof message.q === "string" ? message.q.trim() : "";
     if (!q) {
         sendResponse({ status: STATUS.ERROR, code: 0, error: "SEARCH requires a non-empty 'q'" });
         return;
     }
-    // §6's operation (the backend search call) lands here.
-    sendResponse({ status: STATUS.ERROR, code: 0, error: "SEARCH is not implemented yet (contract §6)" });
+
+    // The pinned route (§6): /search/?q= URL-encoded, through authFetch —
+    // the §4 gate (a 401 → one recovery → one retry; a dead session is
+    // UNAUTHENTICATED + the frontend sign-in URL) on the §5 shared path
+    // (the active AUTH_MODE's credential behavior). `k` and `min_score`
+    // are deliberately NOT sent: the backend has no default result cap
+    // and the owner's decision is that the popup renders every result
+    // the backend returns — no cap, not even a client-side one.
+    const result = await authFetch(`/search/?q=${encodeURIComponent(q)}`);
+
+    // Every non-OK envelope passes through untransformed — UNAUTHENTICATED,
+    // ERROR (the backend body as-is), FETCH_ERROR (network) — the
+    // documented recoverable failure shapes: the popup can retry with a
+    // new Enter (acceptance 3).
+    if (result.status !== STATUS.OK) {
+        sendResponse(result);
+        return;
+    }
+
+    // A 200's body is the result list itself (the SearchViewSet returns
+    // the many=True serializer data — a bare JSON array, no wrapper
+    // object): the backend's result objects pass through untransformed
+    // (capture_id, rank, score, summary_text, created_at, chunks[] — plus
+    // source_url once the §7 B1 completion lands). The embedding vector
+    // is not in the backend's response, so nothing secret crosses the bus.
+    // A 200 whose body is somehow not a JSON array (a misbehaving proxy)
+    // degrades to an empty list — never a crash, never a fabricated hit.
+    sendResponse({ status: STATUS.OK, results: Array.isArray(result.data) ? result.data : [] });
 }
 
 // LIBRARY — popup → worker (request/response; reserved — the v1 popup
