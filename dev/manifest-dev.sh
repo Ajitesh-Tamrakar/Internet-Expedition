@@ -45,9 +45,11 @@ fi
 rm -rf "$OUT"
 mkdir -p "$OUT"
 # Copy the tree, skipping the load dir itself: it lives inside extension/
-# by default, and a plain recursive copy would copy its own output.
+# by default, and a plain recursive copy would copy its own output. The
+# in-repo test net (extension/test — section 9) is not extension code;
+# keep it out of the load dir.
 OUT_BASE="$(basename "$OUT")"
-(cd "$SRC" && tar cf - --exclude "$OUT_BASE" .) | (cd "$OUT" && tar xf -)
+(cd "$SRC" && tar cf - --exclude "$OUT_BASE" --exclude test .) | (cd "$OUT" && tar xf -)
 
 # Chrome reads manifest.json — swap in the dev variant.
 rm -f "$OUT/manifest.json"
