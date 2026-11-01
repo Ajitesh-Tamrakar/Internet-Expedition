@@ -1,6 +1,8 @@
 // Internet Expedition — popup (contract §11: authentication-state
-// integration; §13: the profile icon's real name + account
-// navigation).
+// integration; §12: sign-in navigation; §13: the profile icon's real
+// name + account navigation; §14: the search field — submit-on-Enter
+// through the bus, loading feedback, recoverable errors, and the
+// results region).
 //
 // The popup does not own authentication: the frontend is the identity
 // interface, and the extension rides the shared browser session. Under
@@ -51,7 +53,8 @@
 // inline in this file (the §1 no-shared-file decision; the payload and
 // response shapes are documented in the contract, once).
 const MSG = {
-    USER: "USER", // popup → worker; doubles as the on-open session check
+    USER:   "USER",   // popup → worker; doubles as the on-open session check
+    SEARCH: "SEARCH", // popup → worker; submit-on-Enter search (§14)
 };
 
 const STATUS = {
@@ -104,6 +107,12 @@ const signedInView = document.getElementById("view-signed-in");
 const signedOutView = document.getElementById("view-signed-out");
 const profileTooltip = document.getElementById("profile-tooltip");
 const profileButton = document.getElementById("profile-button");
+
+// §14: the search surface (§10's slots) — the field, the feedback line,
+// and the scrollable results region below the search row.
+const searchInput = document.getElementById("search-input");
+const searchStatus = document.getElementById("search-status");
+const searchResults = document.getElementById("search-results");
 
 profileTooltip.textContent = PROFILE_NAME_FALLBACK;
 
@@ -204,6 +213,164 @@ document.getElementById("sign-in-button").addEventListener("click", () => {
 // collects nothing; it only navigates.
 profileButton.addEventListener("click", () => {
     chrome.tabs.create({ url: FRONTEND_ORIGIN + "/account" });
+});
+
+// ================================================================
+// SEARCH (contract §14 — the search integration)
+// ================================================================
+//
+// The field is wired to the worker's SEARCH handler (contract §6) through
+// the bus. The popup never talks to the Django API itself (each query can
+// trigger an embedding request — which is why search is submit-on-Enter,
+// never per-keystroke). One Enter → one `SEARCH { q }` → the worker's
+// `GET /search/?q=`. While the (≥4.5 s) call is in flight the field is
+// disabled and a "Searching…" indicator shows; on success the results
+// replace it, on a failure a recoverable error shows and the field is
+// usable again (a new Enter retries). The popup must not crash on a failed
+// request, and it never presents stale results as current.
+//
+// Results render in the scrollable region below the search row, in the
+// worker's rank order — EVERY result the backend returns, no cap (the
+// backend has no default limit; the owner's decision stands). Each row:
+// the capture's summary_text (two-line clamp), its score (the cosine
+// similarity, shown as-is — higher = more relevant, never a percentage),
+// and its created_at date. A row with a source_url is a link opening that
+// URL in a new tab; a row without one is inert. Row text is set via
+// textContent, never innerHTML (the summary is backend/user content).
+
+// A month-name date formatter (pure — no I/O) and the score shown as-is.
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function formatScore(score) {
+    const n = Number(score);
+    return Number.isFinite(n) ? n.toFixed(2) : "—";
+}
+
+// The created_at ISO stamp → a stable, locale-independent "Mon D, YYYY".
+function formatDate(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+}
+
+// One user-facing line for a failed search, from the §1 response envelope.
+// Every failure is recoverable: the caller re-enables the field so a new
+// Enter retries. UNAUTHENTICATED → the session is gone (the C2 broadcast
+// flips the view; this is the transient line until it does).
+function errorText(result) {
+    if (!result) return "Something went wrong. Please try again.";
+    if (result.status === STATUS.UNAUTHENTICATED) {
+        return "You're signed out. Sign in to search.";
+    }
+    const err = result.error;
+    if (err && typeof err === "object") {
+        // DRF {"detail": …} …
+        if (typeof err.detail === "string" && err.detail.trim()) return err.detail;
+        // … or allauth {"errors": [{"message": …}]}
+        if (Array.isArray(err.errors) && err.errors[0] && typeof err.errors[0].message === "string") {
+            return err.errors[0].message;
+        }
+    } else if (typeof err === "string" && err.trim()) {
+        return err; // a FETCH_ERROR's error string (a network failure)
+    }
+    if (result.status === STATUS.FETCH_ERROR) {
+        return "Network error — check your connection and try again.";
+    }
+    return "Something went wrong. Please try again.";
+}
+
+// One result row: the summary (two-line clamp; a link when source_url is
+// present, inert otherwise) over a meta line (the score + the date).
+function buildResultRow(result) {
+    const row = document.createElement("div");
+    row.className = "result-row";
+
+    const summaryText =
+        typeof result.summary_text === "string" && result.summary_text.trim()
+            ? result.summary_text
+            : "(no summary)";
+
+    const summary = document.createElement(result.source_url ? "a" : "span");
+    summary.className = "result-summary";
+    summary.textContent = summaryText; // textContent — never innerHTML
+    if (result.source_url) {
+        summary.href = result.source_url;
+        summary.target = "_blank";
+        summary.rel = "noopener noreferrer";
+    }
+    row.appendChild(summary);
+
+    const meta = document.createElement("div");
+    meta.className = "result-meta";
+    const score = document.createElement("span");
+    score.className = "result-score";
+    score.textContent = formatScore(result.score);
+    meta.appendChild(score);
+    const date = document.createElement("span");
+    date.className = "result-date";
+    date.textContent = formatDate(result.created_at);
+    meta.appendChild(date);
+    row.appendChild(meta);
+
+    return row;
+}
+
+// The full result set into the scrollable region, in the worker's rank
+// order — every row, no cap. (The region is empty on open; results appear
+// only after a search, never a default list.)
+function renderResults(results) {
+    searchResults.textContent = ""; // clear (drops the children)
+    for (const result of results) {
+        searchResults.appendChild(buildResultRow(result));
+    }
+}
+
+// One search: guard against overlap, show the in-flight state, send
+// `SEARCH { q }` through the bus, and render the answer (results, or a
+// recoverable error). The field is re-enabled on every path.
+let searching = false;
+
+async function runSearch(q) {
+    if (searching) return;
+    searching = true;
+    searchInput.disabled = true;
+    searchStatus.textContent = "Searching…";
+    searchResults.textContent = ""; // never present stale results as current
+
+    try {
+        let response;
+        try {
+            response = await chrome.runtime.sendMessage({ type: MSG.SEARCH, q });
+        } catch {
+            // The worker was unreachable for this send (reaped, or the
+            // channel voided): a network-style failure, not an answer.
+            response = { status: STATUS.FETCH_ERROR, error: "Could not reach the extension." };
+        }
+        if (response && response.status === STATUS.OK) {
+            const results = Array.isArray(response.results) ? response.results : [];
+            renderResults(results);
+            searchStatus.textContent = results.length
+                ? `${results.length} result${results.length === 1 ? "" : "s"}`
+                : "No matches";
+        } else {
+            searchStatus.textContent = errorText(response);
+        }
+    } finally {
+        searching = false;
+        searchInput.disabled = false;
+    }
+}
+
+// Submit on Enter only — typing sends nothing (no per-keystroke request;
+// each query costs an embedding call). A blank query is a no-op (the worker
+// would 400 it; don't call it).
+searchInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    const q = searchInput.value.trim();
+    if (!q) return;
+    runSearch(q);
 });
 
 // On open: pre-render from the cache, then let the check win.

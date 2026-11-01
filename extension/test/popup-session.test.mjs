@@ -35,10 +35,18 @@
 //        name from the backend (first + last; the fallback chain: a
 //        blank part → display → email → the neutral label) and a click
 //        opens exactly FRONTEND_ORIGIN + /account in a new tab
+//   AT9  (contract §14) the search field: typing sends nothing, Enter
+//        sends exactly one SEARCH (the worker calls GET /search/?q=),
+//        the in-flight state is visible, results render (all, rank
+//        order, two-line summary + score + date, source_url → new-tab
+//        link, no source_url → inert), a failed search shows a
+//        recoverable error the user can retry, and a blank Enter is a
+//        no-op
 //   audits   the §11 contract bullets on the popup source: no cookie
 //        read, no token, no direct backend call, no storage write, no
-//        timers; the popup carries its own FRONTEND_ORIGIN constant and
-//        assembles the name from the USER response's user payload (§13)
+//        timers; the popup carries its own FRONTEND_ORIGIN constant,
+//        assembles the name from the USER response's user payload (§13),
+//        and defines the SEARCH bus name inline (§14)
 //
 // No bench required — the fake backend stands in for the Django app.
 // Run:  node extension/test/popup-session.test.mjs
@@ -89,6 +97,61 @@ async function settleUserCheck(bench, popup, mark) {
     popup.pump();
 }
 
+// §14 search helpers. A /search/ GET on the fake backend, and the settle
+// that waits for it + the response round-trip. A SUCCESSFUL search writes
+// no session state (no C2 broadcast), so — unlike settleUserCheck — no
+// pump is needed: the popup renders directly from the response.
+const searchGets = (bench, from = 0) =>
+    bench.backend.requests.slice(from).filter((r) => r.method === "GET" && r.path.startsWith("/search/")).length;
+
+async function settleSearch(bench, mark) {
+    await waitFor(() => searchGets(bench, mark) >= 1);
+    await sleep(30);
+}
+
+// Fire the search field's keydown handler (a synthetic Enter). Sets the
+// field's value first — the handler reads the element's value, not an
+// argument — then dispatches a keydown the popup's listener receives.
+function pressSearchEnter(popup, value) {
+    const input = popup.elements["search-input"];
+    input.value = value;
+    for (const { type, fn } of input.listeners) {
+        if (type === "keydown") fn({ key: "Enter", preventDefault() {} });
+    }
+}
+
+// A minimal DOM element stub for the §14 search surface (the popup's
+// createElement target): a tagged node with a children array, a
+// textContent that — like the real DOM — DROPS the children when set, and
+// the attribute surface buildResultRow uses (className / href / target /
+// rel / value / disabled) + addEventListener. The views, tooltip, and
+// buttons keep their existing hand-rolled shapes (AT1–AT8 depend on them);
+// only the new search nodes use this factory.
+function makeEl(tag) {
+    const el = {
+        tagName: tag.toUpperCase(),
+        children: [],
+        className: "",
+        href: undefined,
+        target: undefined,
+        rel: undefined,
+        value: "",
+        disabled: false,
+        hidden: false,
+        listeners: [],
+        _text: "",
+        appendChild(child) { this.children.push(child); return child; },
+        setAttribute(name, val) { this[name] = val; },
+        addEventListener(type, fn) { this.listeners.push({ type, fn }); },
+    };
+    Object.defineProperty(el, "textContent", {
+        get() { return this._text; },
+        // Like the real DOM, setting textContent replaces the children.
+        set(v) { this._text = v; this.children.length = 0; },
+    });
+    return el;
+}
+
 // ------------------------------------------------------------------
 // PopupProcess — one popup "open": the real popup.js in a fresh vm
 // context. The popup is ephemeral (contract rule 9): a close is a
@@ -120,10 +183,20 @@ class PopupProcess {
                 listeners: [],
                 addEventListener(type, fn) { this.listeners.push({ type, fn }); },
             },
+            // §14: the search surface (the §10 slots). The input and the
+            // feedback/results nodes need the createElement/appendChild/
+            // value surface buildResultRow + runSearch use, so they use the
+            // makeEl factory; the nodes above keep their hand-rolled shapes.
+            "search-input": makeEl("input"),
+            "search-status": makeEl("div"),
+            "search-results": makeEl("div"),
         };
         const sandbox = {
             console,
-            document: { getElementById: (id) => elements[id] },
+            document: {
+                getElementById: (id) => elements[id],
+                createElement: (tag) => makeEl(tag),
+            },
             chrome: {
                 tabs: { create: (props) => this.tabCreations.push(props) },
                 storage: {
@@ -204,6 +277,7 @@ class PopupProcess {
 async function main() {
     const backgroundSource = readFileSync(path.join(EXT_DIR, "background.js"), "utf8");
     const popupSource = readFileSync(path.join(EXT_DIR, "popup", "popup.js"), "utf8");
+    const popupCss = readFileSync(path.join(EXT_DIR, "popup", "popup.css"), "utf8");
     void backgroundSource; // the worker source is loaded by the harness
     // The popup's per-manifest origin constant, read from the source
     // under test — origin-sensitive assertions track whichever build is
@@ -228,6 +302,12 @@ async function main() {
     check("popup: the tooltip name is assembled from the USER response's user payload, with the §13 fallback chain",
         /first_name/.test(popupSource) && /last_name/.test(popupSource) &&
         /\.display/.test(popupSource) && /\.email/.test(popupSource));
+    check("popup: the SEARCH bus name is defined inline (§14, the §1 no-shared-file decision)",
+        /SEARCH:\s*"SEARCH"/.test(popupSource));
+    check("popup: search is submit-on-Enter (a keydown handler), never per-keystroke",
+        /addEventListener\("keydown"/.test(popupSource) && !/addEventListener\("input"/.test(popupSource));
+    check("popup.css: the summary is two-line clamped (§14 acceptance 6)",
+        /-webkit-line-clamp:\s*2/.test(popupCss));
 
     // ------------------------------------------------- bench
     const bench = await makeBench({ backendOpts: { results: [] } });
@@ -444,6 +524,97 @@ async function main() {
     check("AT8: a 200 with no user degrades to the neutral label (never a crash, never an invented identity)",
         p13.elements["profile-tooltip"].textContent === "Account");
     bench.backend.user = { id: 7, display: "s9probe", email: "s9@probe.test", first_name: "S9", last_name: "Probe", has_usable_password: true, username: "s9probe" };
+
+    // ------------------------------------------ AT9: search (contract §14)
+    console.log("\n[AT9] the search field (submit-on-Enter, loading, results, recoverable errors)");
+    await respawn();
+    bench.backend.login();
+    await bench.worker.send(EV_IN);
+    await waitFor(() => state(bench) === "signed_in");
+
+    // Canned results: one link+summary, one inert+summary, one link+no-summary.
+    bench.backend.results = [
+        { capture_id: "cap-1", rank: 1, score: 0.9, summary_text: "First summary about transformers and attention.", created_at: "2026-03-15T12:00:00Z", source_url: "https://example.com/first", chunks: [] },
+        { capture_id: "cap-2", rank: 2, score: 0.5, summary_text: "Second summary.", created_at: "2025-12-01T12:00:00Z", source_url: null, chunks: [] },
+        { capture_id: "cap-3", rank: 3, score: 0.2, summary_text: null, created_at: "2025-06-10T12:00:00Z", source_url: "https://example.com/third", chunks: [] },
+    ];
+
+    const mark9 = bench.backend.requests.length;
+    const p14 = openPopup();
+    await settleUserCheck(bench, p14, mark9); // the signed-in view is up
+
+    // AT9a: typing (no Enter) sends nothing.
+    p14.elements["search-input"].value = "machine";
+    p14.elements["search-input"].value = "machine learning"; // "typing" — no keydown
+    check("AT9a: typing without Enter sends zero SEARCH and zero /search/ GETs",
+        p14.sent.filter((m) => m.type === "SEARCH").length === 0 && searchGets(bench, mark9) === 0);
+
+    // AT9b: Enter sends exactly one SEARCH { q }; the in-flight state is
+    // set synchronously (before the await), then the worker calls /search/.
+    const reqsBefore9 = bench.backend.requests.length;
+    pressSearchEnter(p14, "machine learning");
+    check("AT9b: the in-flight state is visible (field disabled + indicator)",
+        p14.elements["search-input"].disabled === true &&
+        p14.elements["search-status"].textContent === "Searching…");
+    check("AT9b: Enter sends exactly one SEARCH carrying the query",
+        p14.sent.filter((m) => m.type === "SEARCH").length === 1 &&
+        p14.sent.find((m) => m.type === "SEARCH").q === "machine learning");
+    await settleSearch(bench, reqsBefore9);
+    check("AT9b: the worker called GET /search/?q= (URL-encoded) exactly once",
+        searchGets(bench, reqsBefore9) === 1 &&
+        bench.backend.requests[reqsBefore9].path === "/search/?q=machine%20learning");
+
+    // AT9c: results render — all of them, in the worker's rank order.
+    const rows = p14.elements["search-results"].children;
+    check("AT9c: every result rendered (no cap), in the worker's rank order, each summary present",
+        rows.length === 3 &&
+        rows[0].children[0].textContent === "First summary about transformers and attention." &&
+        rows[1].children[0].textContent === "Second summary." &&
+        rows[2].children[0].textContent === "(no summary)");
+    check("AT9c: a source_url row is a link opening a new tab; a null row is inert",
+        rows[0].children[0].tagName === "A" && rows[0].children[0].href === "https://example.com/first" &&
+        rows[0].children[0].target === "_blank" &&
+        rows[2].children[0].tagName === "A" && rows[2].children[0].href === "https://example.com/third" &&
+        rows[1].children[0].tagName === "SPAN" && rows[1].children[0].href === undefined);
+    check("AT9c: each row carries its score (as-is) and its created_at date",
+        rows[0].children[1].children[0].textContent === "0.90" && rows[0].children[1].children[1].textContent === "Mar 15, 2026" &&
+        rows[1].children[1].children[0].textContent === "0.50" && rows[1].children[1].children[1].textContent === "Dec 1, 2025" &&
+        rows[2].children[1].children[0].textContent === "0.20" && rows[2].children[1].children[1].textContent === "Jun 10, 2025");
+    check("AT9c: the in-flight indicator is replaced by the results, the field re-enabled",
+        p14.elements["search-status"].textContent === "3 results" &&
+        p14.elements["search-input"].disabled === false);
+
+    // AT9d: a failed search shows a recoverable error; the field stays
+    // usable; a retry works.
+    bench.backend.faulty = true; // every route 500s (a 5xx, not a verdict)
+    const reqsBefore9d = bench.backend.requests.length;
+    pressSearchEnter(p14, "machine learning");
+    await settleSearch(bench, reqsBefore9d);
+    check("AT9d: a failed search shows a recoverable error (the backend's own message)",
+        p14.elements["search-status"].textContent === "Internal Server Error");
+    check("AT9d: the results region is cleared (no stale data presented as current)",
+        p14.elements["search-results"].children.length === 0);
+    check("AT9d: the field is re-enabled — a new Enter can retry",
+        p14.elements["search-input"].disabled === false);
+    bench.backend.faulty = false;
+
+    const reqsBefore9e = bench.backend.requests.length;
+    pressSearchEnter(p14, "machine learning");
+    await settleSearch(bench, reqsBefore9e);
+    check("AT9d: a retry after the failure renders the results again",
+        p14.elements["search-results"].children.length === 3 &&
+        p14.elements["search-status"].textContent === "3 results");
+
+    // AT9e: a blank Enter is a no-op (no request, no error, state unchanged).
+    const reqsBefore9f = bench.backend.requests.length;
+    pressSearchEnter(p14, "   ");
+    await sleep(30);
+    check("AT9e: a blank query is a no-op (no request, the prior status stands)",
+        searchGets(bench, reqsBefore9f) === 0 &&
+        p14.elements["search-status"].textContent === "3 results");
+
+    // Restore the bench for the final invariants.
+    bench.backend.results = [];
 
     // ------------------------------------------ final invariants
     console.log("\n[final] invariants, after everything");
