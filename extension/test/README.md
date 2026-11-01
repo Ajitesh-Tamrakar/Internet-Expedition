@@ -46,16 +46,21 @@ popup's `chrome.storage.onChanged` with Chrome-shaped change objects
 (the C2 broadcast — the popup's only live link). Covers the §11
 acceptance tests (open signed-in / signed-out, the stale-cache
 "response always wins" rule, the live flip with no reload, the
-worker-restart re-open) plus the §12 sign-in-button check (opens the
+worker-restart re-open), the §12 sign-in-button check (opens the
 popup's own `FRONTEND_ORIGIN + /login`, which matches the worker's
 copy — origin-sensitive assertions read the constant from whichever
-build is loaded, so the same file tracks `.dev-load`), and the §11
-static audits (no cookie read, no token, no direct backend call, no
-storage write, no timers).
+build is loaded, so the same file tracks `.dev-load`), the §13
+profile-icon checks (real name + `/account`, the fallback chain), the
+§14 search checks (AT9), the §15 final-integration AT10 (the complete
+popup across both states, the no-library-on-open rule, the worker's
+reserved `LIBRARY`/`SIGN_OUT` handlers still answering, the
+synchronization surviving), and the static audits (no cookie read, no
+token, no direct backend call, no storage write, no timers, no removed
+v1 leftover, black-and-white CSS).
 
 - **Run:** `node extension/test/popup-session.test.mjs`
 - **Needs:** nothing (node ≥ 22). No bench, no browser.
-- **Duration:** seconds. ~37 checks.
+- **Duration:** seconds. ~83 checks.
 
 ### Tier 2 — `browser-integration.mjs` (full integration, real bench)
 

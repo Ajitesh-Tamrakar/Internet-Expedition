@@ -1,7 +1,8 @@
 // ==================================================================
-// Sections 11-13 (contract "Popup — authentication-state integration"
-// + "sign-in navigation" + "profile icon and account navigation") —
-// the in-repo acceptance net.
+// Sections 11-15 (contract "Popup — authentication-state integration"
+// + "sign-in navigation" + "profile icon and account navigation" +
+// "search integration" + "final integration and cleanup") — the
+// in-repo acceptance net.
 //
 // Runs the REAL extension/popup/popup.js in a node:vm context (a
 // minimal DOM stub + a chrome stub) against the REAL
@@ -42,6 +43,14 @@
 //        link, no source_url → inert), a failed search shows a
 //        recoverable error the user can retry, and a blank Enter is a
 //        no-op
+//   AT10 (contract §15) the final integration and cleanup: the
+//        complete popup across both states re-asserted (the
+//        no-library-on-open rule, the profile name + /account,
+//        submit-on-Enter search, the loaded build's origins), the
+//        worker's reserved LIBRARY / SIGN_OUT handlers still answering
+//        (built, not retired), and the session synchronization
+//        (the state write flipping a (re)opened popup) surviving the
+//        finished popup
 //   audits   the §11 contract bullets on the popup source: no cookie
 //        read, no token, no direct backend call, no storage write, no
 //        timers; the popup carries its own FRONTEND_ORIGIN constant,
@@ -275,10 +284,10 @@ class PopupProcess {
 
 // ------------------------------------------------------------------
 async function main() {
-    const backgroundSource = readFileSync(path.join(EXT_DIR, "background.js"), "utf8");
+    const backgroundSource = readFileSync(path.join(EXT_DIR, "background.js"), "utf8"); // the harness runs it; the §15 audits read it
     const popupSource = readFileSync(path.join(EXT_DIR, "popup", "popup.js"), "utf8");
     const popupCss = readFileSync(path.join(EXT_DIR, "popup", "popup.css"), "utf8");
-    void backgroundSource; // the worker source is loaded by the harness
+    const popupHtml = readFileSync(path.join(EXT_DIR, "popup", "popup.html"), "utf8");
     // The popup's per-manifest origin constant, read from the source
     // under test — origin-sensitive assertions track whichever build is
     // loaded (committed = the pinned origin; .dev-load = the local one).
@@ -308,6 +317,48 @@ async function main() {
         /addEventListener\("keydown"/.test(popupSource) && !/addEventListener\("input"/.test(popupSource));
     check("popup.css: the summary is two-line clamped (§14 acceptance 6)",
         /-webkit-line-clamp:\s*2/.test(popupCss));
+
+    // ------------------------------------------- §15 cleanup audits (static)
+    // The §15 "removed and verified absent" pass, run over the sources
+    // with their comments stripped: the files legitimately *document*
+    // what earlier sections removed (the "no sign-out button" prose),
+    // so the audit must see code, not prose.
+    console.log("\n[audit] the §15 cleanup (the removed and verified absent)");
+    const codeOnly = (source) =>
+        source
+            .replace(/\/\*[\s\S]*?\*\//g, "") // block comments
+            .replace(/\/\/[^\n]*/g, "")       // line comments
+            .replace(/<!--[\s\S]*?-->/g, ""); // HTML comments
+    const htmlCode = codeOnly(popupHtml);
+    const jsCode = codeOnly(popupSource);
+    const cssCode = codeOnly(popupCss);
+    const workerCode = codeOnly(backgroundSource);
+
+    check("§15: no §10 temporary state flag in the popup (the §11 USER check replaced it)",
+        !/TEMP_SESSION_STATE/i.test(jsCode));
+    check("§15: the popup speaks exactly its two catalog names — no LIBRARY, no SIGN_OUT, no SAVE, no SESSION_EVENT, no CAPTURE_WEB",
+        !/\b(LIBRARY|SIGN_OUT|SAVE|SESSION_EVENT|CAPTURE_WEB)\b/.test(jsCode));
+    check("§15: no library fetching in the popup (no /captures/ route, no list of any kind)",
+        !/\/captures\//.test(jsCode));
+    check("§15: no sign-out control in the popup (no button, no handler, no route)",
+        !/sign[\s-]*out/i.test(jsCode) && !/sign[\s-]*out/i.test(htmlCode));
+    check("§15: no signed-in header with an email (the layout displays no identity)",
+        !/\bemail\b/i.test(htmlCode));
+    check("§15: the worker keeps the reserved types — all seven catalog names, LIBRARY + SIGN_OUT still registered, the SESSION_EVENT relay and the session_state sync intact (removing popup UI never removes the synchronization)",
+        ["SAVE", "CAPTURE_WEB", "SESSION_EVENT", "SEARCH", "LIBRARY", "SIGN_OUT", "USER"].every(
+            (n) => new RegExp(`\\b${n}\\b`).test(workerCode)) &&
+        /listen\(MSG\.LIBRARY,/.test(workerCode) &&
+        /listen\(MSG\.SIGN_OUT,/.test(workerCode) &&
+        /notify\(MSG\.SESSION_EVENT,/.test(workerCode) &&
+        /session_state/.test(workerCode));
+    check("§15: the palette is black and white only (no other color value in the CSS)",
+        (cssCode.match(/#[0-9a-fA-F]{3,8}\b/g) || []).every((h) => h === "#000" || h === "#fff"));
+    check("§15: no gradients, shadows, animations, or transitions in the CSS",
+        !/gradient|box-shadow|animation|@keyframes|transition/i.test(cssCode));
+    check("§15: no CSS framework (one local stylesheet, no @import)",
+        (htmlCode.match(/<link[^>]*stylesheet[^>]*>/gi) || []).length === 1 &&
+        /href="popup\.css"/.test(htmlCode) && !/@import/i.test(cssCode));
+    check("§15: still the ~360 px compact width", /width:\s*360px/.test(cssCode));
 
     // ------------------------------------------------- bench
     const bench = await makeBench({ backendOpts: { results: [] } });
@@ -615,6 +666,69 @@ async function main() {
 
     // Restore the bench for the final invariants.
     bench.backend.results = [];
+
+    // ------------------------------------------ AT10: §15 final integration and cleanup
+    console.log("\n[AT10] §15 — the complete popup, both states, and what stays");
+    await respawn();
+    bench.backend.login();
+    await bench.worker.send(EV_IN);
+    await waitFor(() => state(bench) === "signed_in");
+
+    // Signed in: the whole view, and the no-library-on-open rule.
+    const mark10 = bench.backend.requests.length;
+    const p15 = openPopup();
+    await settleUserCheck(bench, p15, mark10);
+    check("AT10: signed in — the search field and profile icon row is the entire view",
+        view(p15) === "signed_in");
+    check("AT10: no library fetching on popup open — the one message sent on open is the {} USER",
+        p15.sent.length === 1 && p15.sent[0].type === "USER" && JSON.stringify(p15.sent[0]) === '{"type":"USER"}');
+
+    // Profile (§13 re-asserted) — the real name, the loaded build's /account.
+    check("AT10: the profile tooltip is the backend's real name, not a placeholder",
+        p15.elements["profile-tooltip"].textContent === "S9 Probe");
+    p15.clickProfile();
+    check("AT10: the profile click opens the loaded build's /account in a new tab",
+        p15.tabCreations.length === 1 && p15.tabCreations[0].url === `${popupFrontendOrigin}/account`);
+
+    // Search (§14 re-asserted) — Enter submits through the worker.
+    bench.backend.results = [
+        { capture_id: "cap-final", rank: 1, score: 0.7, summary_text: "Final integration check.", created_at: "2026-11-01T00:00:00Z", source_url: null, chunks: [] },
+    ];
+    const reqsBefore10 = bench.backend.requests.length;
+    pressSearchEnter(p15, "final integration check");
+    await settleSearch(bench, reqsBefore10);
+    check("AT10: Enter submits exactly one SEARCH, the worker calls GET /search/?q= once, the result renders",
+        p15.sent.filter((m) => m.type === "SEARCH").length === 1 &&
+        searchGets(bench, reqsBefore10) === 1 &&
+        p15.elements["search-results"].children.length === 1 &&
+        p15.elements["search-status"].textContent === "1 result");
+    bench.backend.results = [];
+
+    check("AT10: across the whole run the popup spoke only USER and SEARCH — no LIBRARY, no SIGN_OUT (acceptance 7)",
+        p15.sent.every((m) => m.type === "USER" || m.type === "SEARCH"));
+
+    // The worker's reserved handlers stay built (§15: cataloged types and
+    // §4/§7 handlers are never retired) — they answer.
+    const lib = await bench.worker.send({ type: "LIBRARY" });
+    check("AT10: the worker's reserved LIBRARY handler still answers ({ status, captures })",
+        lib !== undefined && lib.status === "OK" && Array.isArray(lib.captures));
+    const signOut = await bench.worker.send({ type: "SIGN_OUT" });
+    check("AT10: the worker's reserved SIGN_OUT handler still answers (the live session flushes to success)",
+        signOut !== undefined && signOut.status === "OK");
+    await waitFor(() => state(bench) === "signed_out");
+
+    // Signed out: the one control — and the synchronization §15 keeps:
+    // the state write plus the USER check drive a (re)opened popup to the
+    // signed-out view.
+    const mark10b = bench.backend.requests.length;
+    const p16 = openPopup();
+    await settleUserCheck(bench, p16, mark10b);
+    check("AT10: signed out — only the centered Sign in remains", view(p16) === "signed_out");
+    p16.clickButton();
+    check("AT10: the Sign in click opens the loaded build's /login in a new tab",
+        p16.tabCreations.length === 1 && p16.tabCreations[0].url === `${popupFrontendOrigin}/login`);
+    check("AT10: this popup also never spoke a reserved name",
+        p16.sent.every((m) => m.type === "USER" || m.type === "SEARCH"));
 
     // ------------------------------------------ final invariants
     console.log("\n[final] invariants, after everything");
