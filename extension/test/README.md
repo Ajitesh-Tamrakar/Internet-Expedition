@@ -12,7 +12,7 @@ This is the milestone board's "M8 net should be the in-repo successor" —
 the throwaway `/tmp` probe harnesses that preceded it (purged on every
 reboot) are retired; these two files are the permanent net.
 
-## The two tiers
+## The tiers
 
 ### Tier 1 — `worker-lifecycle.test.mjs` (worker-level, no bench)
 
@@ -35,6 +35,27 @@ storage — the exact MV3 lifecycle.
   in-memory-only durable state, no token in storage or any bus response,
   exactly the two storage keys).
 - **Duration:** seconds. ~60 checks.
+
+### Tier 1b — `popup-session.test.mjs` (popup-level, no bench)
+
+Runs the **real `extension/popup/popup.js`** in a `node:vm` context
+(minimal DOM stub + chrome stub) against the real worker through the
+same `harness.mjs` bench: the popup's `USER` send rides the worker's
+real bus listener, and the worker's `session_state` writes fire the
+popup's `chrome.storage.onChanged` with Chrome-shaped change objects
+(the C2 broadcast — the popup's only live link). Covers the §11
+acceptance tests (open signed-in / signed-out, the stale-cache
+"response always wins" rule, the live flip with no reload, the
+worker-restart re-open) plus the §12 sign-in-button check (opens the
+popup's own `FRONTEND_ORIGIN + /login`, which matches the worker's
+copy — origin-sensitive assertions read the constant from whichever
+build is loaded, so the same file tracks `.dev-load`), and the §11
+static audits (no cookie read, no token, no direct backend call, no
+storage write, no timers).
+
+- **Run:** `node extension/test/popup-session.test.mjs`
+- **Needs:** nothing (node ≥ 22). No bench, no browser.
+- **Duration:** seconds. ~37 checks.
 
 ### Tier 2 — `browser-integration.mjs` (full integration, real bench)
 
@@ -127,10 +148,12 @@ actually carries.
 - **Mid-flight worker kills** — a live CDP channel keeps a real worker
   alive, so a browser run cannot force one; Tier 1's harness models it
   exactly (in-flight cancellation, wake, re-resolution).
-- **The popup** — a v1 stub at this stage (§10–15 land after §9). Bus
-  messages the popup will send are driven from the relay's isolated world
-  over the same `chrome.runtime` channel; the "rendered state" is the
-  worker's published `session_state`, which the popup will render.
+- **The popup in the browser** — a headless run does not open the popup
+  page; its session-state (§11) and sign-in (§12) logic is covered
+  in-repo by Tier 1b (`popup-session.test.mjs`). The bus messages the
+  popup sends are driven from the relay's isolated world over the same
+  `chrome.runtime` channel, and the "rendered state" observed here is
+  the worker's published `session_state` — the value the popup renders.
 - **The frontend's sync-event emitter** — a carried open item in
   `IE-ClientSide`; the pass posts the agreed `{type}` payload itself (labeled
   "the simulated emitter") — the relay + worker halves are the ones under

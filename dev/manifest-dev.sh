@@ -78,10 +78,20 @@ sed_inplace \
     -e "/^const API_BASE_URL/s|$PROD_ORIGIN|$API_ORIGIN|" \
     -e "/^const FRONTEND_ORIGIN/s|$PROD_ORIGIN|$VITE_ORIGIN|" \
     "$OUT/background.js"
+# The popup's own copy of the frontend origin (contract §12 — the Sign
+# in button's /login URL): the committed popup.js carries the pinned
+# origin, the same line-addressed swap applies.
+sed_inplace \
+    -e "/^const FRONTEND_ORIGIN/s|$PROD_ORIGIN|$VITE_ORIGIN|" \
+    "$OUT/popup/popup.js"
 
 # Sanity: the load dir must now carry the local origins.
 grep -q "$API_ORIGIN" "$OUT/background.js" || {
     echo "error: $OUT/background.js does not carry $API_ORIGIN after substitution" >&2
+    exit 1
+}
+grep -q "$VITE_ORIGIN" "$OUT/popup/popup.js" || {
+    echo "error: $OUT/popup/popup.js does not carry $VITE_ORIGIN after substitution" >&2
     exit 1
 }
 grep -q "$VITE_ORIGIN" "$OUT/background.js" || {

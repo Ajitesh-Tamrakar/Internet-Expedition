@@ -70,9 +70,13 @@
 //     net stays attached for observability, reads liveness from the
 //     silent-eval signal, drops the zombie record, and re-attaches to
 //     the respawned worker (a NEW targetId).
-//   - The popup is a v1 stub at this stage of the build (§10–15 land
-//     after §9): "the rendered state" is the worker's published
-//     session_state — the popup will render exactly that.
+//   - The popup is not opened in this net: its session-state logic
+//     (§11) and sign-in navigation (§12) are covered in-repo by
+//     popup-session.test.mjs (the real popup.js in a vm DOM/chrome
+//     stub against the real worker). This net drives the same bus
+//     messages from the relay's isolated world, and "the rendered
+//     state" is the worker's published session_state — the value the
+//     popup renders.
 //   - The page can silently end at chrome-error:// if the bench is not
 //     reachable; every navigation verifies location.href actually
 //     reached the app origin before anything runs in it.
