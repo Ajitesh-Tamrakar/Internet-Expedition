@@ -1,7 +1,56 @@
 <!DOCTYPE html>
 <html>
+<head>
+    <meta charset="utf-8" />
+    <title>Internet Expedition</title>
+    <link rel="stylesheet" href="popup.css" />
+</head>
 <body>
-  <h1>Bookmark</h1>
-  <script src="popup.js"></script>
+    <main class="popup">
+        <!-- Signed-out view (contract §10): one centered Sign in button
+             and nothing else — no search field, no profile icon, no
+             email, no capture list, no sign-out button. -->
+        <section id="view-signed-out" class="view view--signed-out" hidden>
+            <button id="sign-in-button" class="sign-in-button" type="button">
+                Sign in
+            </button>
+        </section>
+
+        <!-- Signed-in view (contract §10): a search field (icon inside)
+             at the top with the profile icon right-aligned on the same
+             row; the field takes most of the width. The area below is
+             left uncluttered — the feedback + results slot §14 fills
+             (results appear only after a search, never a default list). -->
+        <section id="view-signed-in" class="view view--signed-in" hidden>
+            <div class="top-row">
+                <div class="search-field">
+                    <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24"
+                         fill="none" stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="11" cy="11" r="7"></circle>
+                        <line x1="21" y1="21" x2="16.5" y2="16.5"></line>
+                    </svg>
+                    <label for="search-input" class="visually-hidden">Search your saved content</label>
+                    <input id="search-input" class="search-input" type="search"
+                           placeholder="Search your saved content" />
+                </div>
+                <div class="profile-slot">
+                    <span id="profile-tooltip" class="profile-tooltip" role="tooltip">User</span>
+                    <button id="profile-button" class="profile-button" type="button"
+                            aria-label="Profile" aria-describedby="profile-tooltip">
+                        <svg width="16" height="16" viewBox="0 0 24 24"
+                             fill="none" stroke="currentColor" stroke-width="2"
+                             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <circle cx="12" cy="8" r="4"></circle>
+                            <path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"></path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+            <div id="search-status" class="search-status" role="status" aria-live="polite"></div>
+            <div id="search-results" class="search-results"></div>
+        </section>
+    </main>
+    <script src="popup.js"></script>
 </body>
 </html>
