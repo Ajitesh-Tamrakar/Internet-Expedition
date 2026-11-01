@@ -1,5 +1,6 @@
 // Internet Expedition — popup (contract §11: authentication-state
-// integration).
+// integration; §13: the profile icon's real name + account
+// navigation).
 //
 // The popup does not own authentication: the frontend is the identity
 // interface, and the extension rides the shared browser session. Under
@@ -14,7 +15,9 @@
 //   1. ON OPEN — the `USER` bus message (contract §7), which doubles as
 //      the session check: the worker verifies against the backend
 //      (contract §4) and answers
-//          { status: "OK", user }           → signed in
+//          { status: "OK", user }           → signed in (the user
+//                                             payload is the tooltip's
+//                                             name — §13)
 //          { status: "UNAUTHENTICATED", … } → signed out
 //          { status: "ERROR" / "FETCH_ERROR" } → the backend didn't
 //      answer — NOT a session verdict: the popup keeps the view it
@@ -38,10 +41,11 @@
 // token (no cookie-jar access of any kind; under the primary design
 // there is no token in the extension to read), talk to the backend
 // directly (the worker is the only extension context that does), or
-// write or remove storage (the worker is the sole writer). The one
-// exception to "the frontend owns identity" is the Sign in button's
-// NAVIGATION (contract §12): it opens the frontend's /login tab and
-// collects nothing itself.
+// write or remove storage (the worker is the sole writer). The
+// exceptions to "the frontend owns identity" are two NAVIGATIONS: the
+// Sign in button (contract §12) opens the frontend's /login tab, and
+// the profile icon (§13) opens its /account tab — both collect nothing
+// themselves.
 
 // The bus name + the response envelope's status vocabulary, defined
 // inline in this file (the §1 no-shared-file decision; the payload and
@@ -86,16 +90,37 @@ const SESSION_STATE_KEY = "session_state";
 // registered origin, this copy).
 const FRONTEND_ORIGIN = "https://internetexpedition.ajiteshtamrakar.com";
 
-// The profile tooltip's name: §10's placeholder. §13 replaces it with
-// the real name from the USER response (first_name + last_name, falling
-// back to display, then email).
-const TEMP_PROFILE_NAME = "User";
+// The profile tooltip's name (contract §13): the real name, assembled
+// from the USER response's user payload — first_name + last_name
+// (space-joined, trimmed); when either part is blank, the `display`
+// field, then `email` (the backend's own fallbacks). §10's placeholder
+// dies here. The one terminal fallback below is a LABEL, never an
+// identity: it shows only before the first USER response lands or when
+// the backend answers signed-in without a usable name — the name itself
+// is never inferred from anything stored locally.
+const PROFILE_NAME_FALLBACK = "Account";
 
 const signedInView = document.getElementById("view-signed-in");
 const signedOutView = document.getElementById("view-signed-out");
 const profileTooltip = document.getElementById("profile-tooltip");
+const profileButton = document.getElementById("profile-button");
 
-profileTooltip.textContent = TEMP_PROFILE_NAME;
+profileTooltip.textContent = PROFILE_NAME_FALLBACK;
+
+// §13: the tooltip text from the USER response's user payload — the
+// backend's account, on every check. A null user (a 200 with no payload
+// — a backend contract violation) degrades to the neutral label, never
+// a crash, never an invented identity.
+function displayNameFor(user) {
+    if (user && user.first_name && user.last_name) {
+        return `${user.first_name} ${user.last_name}`.trim();
+    }
+    if (user) {
+        if (user.display) return user.display;
+        if (user.email) return user.email;
+    }
+    return PROFILE_NAME_FALLBACK;
+}
 
 function render(state) {
     signedInView.hidden = state !== SESSION_STATES.SIGNED_IN;
@@ -131,6 +156,9 @@ async function checkSession() {
     if (!response) return; // the channel closed with nothing — same as above
     if (response.status === STATUS.OK) {
         render(SESSION_STATES.SIGNED_IN);
+        // §13: the same response carries the user details — the tooltip's
+        // name comes from the backend on every check, never from storage.
+        profileTooltip.textContent = displayNameFor(response.user);
     } else if (response.status === STATUS.UNAUTHENTICATED) {
         render(SESSION_STATES.SIGNED_OUT);
     }
@@ -148,7 +176,14 @@ async function checkSession() {
 chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local" || !(SESSION_STATE_KEY in changes)) return;
     const state = stateFromSignal(changes[SESSION_STATE_KEY].newValue);
-    if (state) render(state);
+    if (!state) return;
+    render(state);
+    // §13: a flip TO signed-in re-runs the USER check — the name must
+    // come from the backend again, never from the stale value in the
+    // tooltip. One check per flip, event-driven (still no polling). A
+    // flip to signed-out sends nothing: the signed-in view is gone, and
+    // the worker already made its own call before writing that state.
+    if (state === SESSION_STATES.SIGNED_IN) checkSession();
 });
 
 // The Sign in button (contract §12): opens the frontend's /login in a
@@ -159,6 +194,16 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 // 3 — no reload). The origin is the FRONTEND one, never the API's.
 document.getElementById("sign-in-button").addEventListener("click", () => {
     chrome.tabs.create({ url: FRONTEND_ORIGIN + "/login" });
+});
+
+// The profile icon (contract §13): opens the frontend's /account in a
+// new tab — the account page, where the user manages their identity.
+// The same FRONTEND_ORIGIN constant and drift rule as §12's Sign in
+// button: the *website* address, never the API origin (in dev the API
+// is on a different port and has no /account page either). The popup
+// collects nothing; it only navigates.
+profileButton.addEventListener("click", () => {
+    chrome.tabs.create({ url: FRONTEND_ORIGIN + "/account" });
 });
 
 // On open: pre-render from the cache, then let the check win.

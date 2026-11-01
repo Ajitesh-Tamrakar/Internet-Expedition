@@ -1,6 +1,7 @@
 // ==================================================================
-// Sections 11-12 (contract "Popup — authentication-state integration"
-// + "sign-in navigation") — the in-repo acceptance net.
+// Sections 11-13 (contract "Popup — authentication-state integration"
+// + "sign-in navigation" + "profile icon and account navigation") —
+// the in-repo acceptance net.
 //
 // Runs the REAL extension/popup/popup.js in a node:vm context (a
 // minimal DOM stub + a chrome stub) against the REAL
@@ -19,7 +20,8 @@
 //        flips to signed-out
 //   AT4  a live flip with no reload: the relay's signed-out event lands
 //        in storage → the open popup re-renders via the C2 broadcast,
-//        with no second USER sent and no backend call
+//        with no second USER sent and no backend call; the flip BACK to
+//        signed-in sends exactly one more USER (the §13 name refresh)
 //   AT5  a worker restart: a re-open while the worker is dead keeps its
 //        pre-render (a voided send is not a verdict); a respawned
 //        worker + a fresh reopen re-requests USER and renders the
@@ -29,9 +31,14 @@
 //   AT7  (contract §12) the Sign in button opens exactly the popup's
 //        FRONTEND_ORIGIN + /login in a new tab, and that constant
 //        matches the worker's copy (three places, one value)
+//   AT8  (contract §13) the profile icon: the tooltip shows the real
+//        name from the backend (first + last; the fallback chain: a
+//        blank part → display → email → the neutral label) and a click
+//        opens exactly FRONTEND_ORIGIN + /account in a new tab
 //   audits   the §11 contract bullets on the popup source: no cookie
 //        read, no token, no direct backend call, no storage write, no
-//        timers; the popup carries its own FRONTEND_ORIGIN constant
+//        timers; the popup carries its own FRONTEND_ORIGIN constant and
+//        assembles the name from the USER response's user payload (§13)
 //
 // No bench required — the fake backend stands in for the Django app.
 // Run:  node extension/test/popup-session.test.mjs
@@ -102,8 +109,13 @@ class PopupProcess {
         const elements = {
             "view-signed-out": { hidden: true },
             "view-signed-in": { hidden: true },
-            "profile-tooltip": { textContent: "User" },
+            "profile-tooltip": { textContent: "Account" },
             "sign-in-button": {
+                hidden: false,
+                listeners: [],
+                addEventListener(type, fn) { this.listeners.push({ type, fn }); },
+            },
+            "profile-button": {
                 hidden: false,
                 listeners: [],
                 addEventListener(type, fn) { this.listeners.push({ type, fn }); },
@@ -179,6 +191,13 @@ class PopupProcess {
             if (type === "click") fn();
         }
     }
+
+    // Fire the profile icon's click handler (contract §13).
+    clickProfile() {
+        for (const { type, fn } of this.elements["profile-button"].listeners) {
+            if (type === "click") fn();
+        }
+    }
 }
 
 // ------------------------------------------------------------------
@@ -206,6 +225,9 @@ async function main() {
     check("popup: exactly one C2 subscription (its only live link)",
         (popupSource.match(/onChanged\.addListener\(/g) || []).length === 1);
     check("popup: carries its own FRONTEND_ORIGIN constant (§12)", Boolean(popupFrontendOrigin));
+    check("popup: the tooltip name is assembled from the USER response's user payload, with the §13 fallback chain",
+        /first_name/.test(popupSource) && /last_name/.test(popupSource) &&
+        /\.display/.test(popupSource) && /\.email/.test(popupSource));
 
     // ------------------------------------------------- bench
     const bench = await makeBench({ backendOpts: { results: [] } });
@@ -291,12 +313,27 @@ async function main() {
     check("AT4: no polling — exactly one USER was ever sent", p4.sent.length === 1);
     check("AT4: the immediate write made no backend call", bench.backend.requests.length === reqsBefore);
 
-    // And the flip back (a real login on the frontend):
+    // And the flip back (a real login on the frontend). The mark is
+    // taken BEFORE the flip: the worker's own session GET for the event
+    // lands with it, and the popup's §13 name-refresh GET lands after
+    // the pump below — both must fall after the mark.
     bench.backend.login();
+    const markFlip = bench.backend.requests.length;
     await bench.worker.send(EV_IN);
     await waitFor(() => state(bench) === "signed_in");
     p4.pump(); await sleep(5); p4.pump();
     check("AT4: the open popup flips back to signed-in on the re-login", view(p4) === "signed_in");
+
+    // §13: the flip TO signed-in refreshes the name — exactly one more
+    // USER (event-driven, still not a poll), whose response re-sets the
+    // tooltip from the backend.
+    await settleUserCheck(bench, p4, markFlip);
+    check("AT4 (§13): the flip to signed-in sends exactly one more USER — no more",
+        p4.sent.length === 2 && p4.sent[1].type === "USER");
+    check("AT4 (§13): exactly one refresh GET — the worker's own check + the popup's, no loop",
+        sessionGets(bench, markFlip) === 2);
+    check("AT4 (§13): the refreshed name is the backend's real first + last",
+        p4.elements["profile-tooltip"].textContent === "S9 Probe");
 
     // ------------------------------------------ AT5: a service-worker restart
     console.log("\n[AT5] a service-worker restart");
@@ -364,6 +401,49 @@ async function main() {
         p9.tabCreations.length === 1 && p9.tabCreations[0].url === `${popupFrontendOrigin}/login`);
     check("AT7: the popup's origin copy matches the worker's (three places, one value)",
         popupFrontendOrigin === bench.constants.FRONTEND_ORIGIN);
+
+    // ------------------------------------------ AT8: profile icon (contract §13)
+    console.log("\n[AT8] the profile icon — the real name + account navigation");
+    await respawn();
+    bench.backend.login();
+    await bench.worker.send(EV_IN);
+    await waitFor(() => state(bench) === "signed_in");
+
+    const mark8 = bench.backend.requests.length;
+    const p10 = openPopup();
+    await settleUserCheck(bench, p10, mark8);
+    check("AT8: hovering the icon shows the real name from the backend, not a placeholder",
+        p10.elements["profile-tooltip"].textContent === "S9 Probe");
+
+    p10.clickProfile();
+    check("AT8: clicking the icon opens exactly the frontend origin's /account in a new tab",
+        p10.tabCreations.length === 1 && p10.tabCreations[0].url === `${popupFrontendOrigin}/account`);
+
+    // The §13 fallback chain — a blank name part → the `display` field,
+    // then `email`, then the neutral label (a label, never an identity).
+    // The fake backend serves this.user per request, so the variants are
+    // live backend answers, not popup-side assumptions.
+    const mark8b = bench.backend.requests.length;
+    bench.backend.user = { id: 7, display: "s9probe", email: "s9@probe.test", first_name: "S9", last_name: "" };
+    const p11 = openPopup();
+    await settleUserCheck(bench, p11, mark8b);
+    check("AT8: a blank last_name falls back to the display field",
+        p11.elements["profile-tooltip"].textContent === "s9probe");
+
+    const mark8c = bench.backend.requests.length;
+    bench.backend.user = { id: 7, display: "", email: "s9@probe.test", first_name: "", last_name: "" };
+    const p12 = openPopup();
+    await settleUserCheck(bench, p12, mark8c);
+    check("AT8: no names and no display falls back to the email",
+        p12.elements["profile-tooltip"].textContent === "s9@probe.test");
+
+    const mark8d = bench.backend.requests.length;
+    bench.backend.user = null; // a 200 with no user — a backend contract violation
+    const p13 = openPopup();
+    await settleUserCheck(bench, p13, mark8d);
+    check("AT8: a 200 with no user degrades to the neutral label (never a crash, never an invented identity)",
+        p13.elements["profile-tooltip"].textContent === "Account");
+    bench.backend.user = { id: 7, display: "s9probe", email: "s9@probe.test", first_name: "S9", last_name: "Probe", has_usable_password: true, username: "s9probe" };
 
     // ------------------------------------------ final invariants
     console.log("\n[final] invariants, after everything");

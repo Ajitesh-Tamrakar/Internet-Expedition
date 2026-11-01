@@ -35,7 +35,11 @@
                            placeholder="Search your saved content" />
                 </div>
                 <div class="profile-slot">
-                    <span id="profile-tooltip" class="profile-tooltip" role="tooltip">User</span>
+                    <!-- The tooltip's static text is a neutral label,
+                         not an identity: popup.js replaces it with the
+                         real name from the USER response (§13) on open
+                         and on every flip to signed-in. -->
+                    <span id="profile-tooltip" class="profile-tooltip" role="tooltip">Account</span>
                     <button id="profile-button" class="profile-button" type="button"
                             aria-label="Profile" aria-describedby="profile-tooltip">
                         <svg width="16" height="16" viewBox="0 0 24 24"

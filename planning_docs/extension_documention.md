@@ -757,3 +757,159 @@ extension/test (the net is not extension code).
 - **§10–15 (the popup)** — the first live consumer of `SEARCH` / `LIBRARY` / `USER` + the sign-in flow; the v1 stub dies there. Tier 2's "rendered state = the worker's published state" proxy becomes a real assertion once the popup renders it.
 - **Carried (unchanged):** the `AUTH_ACCESS_COOKIE_PATH=/` deployment-env sign-off; the Frontend-task emitter (`IE-ClientSide` — when it lands, Tier 2's simulated emission becomes redundant); the §1 `const MSG` collision (board §6 — the injected-button save flow is dead on the four platform origins until it lands); the `AUTH_MODE="header"` flip stays owner-only.
 - **New observation for the owner (backend-side, not a §9 scope item):** the backend enforces one-session-at-a-time — a login while a session is still alive returns **409** with no token cookies. Inside the 7-day session lifetime this is correct protection; the net now always flushes (the worker's `SIGN_OUT`) before a re-login. The one case worth a one-off verification against the deployed backend: after the session has *naturally* expired (7-day refresh expiry → the stateful-validation "session expiring" clause), a fresh login should mint tokens normally rather than 409 on the stale session row.
+
+---
+
+## Popup — structure and layout — `PopUp_Background_message_relay.md` §10 (2026-11-01)
+
+**Session:** 2026-11-01 — **backfill entry**: the work landed in commit `00ae18d` (owner-committed), whose §0.4 docs update never happened; this entry is written from the landed code, re-verified in this session. **Branch:** `cloud-migration`. §1–§9 assumed implemented (the worker is complete; §10 is pure popup — `extension/popup/` only, nothing else touched).
+
+### 1. Objective
+
+Contract §10: replace the v1 popup stub **whole, atomically** — the 7-line `popup.html` + the 4-line `popup.js` launcher (opens `localhost:8081`, `window.close()`) — with both wireframe layouts: signed-out = one centered Sign in button and nothing else (no search field, no profile icon, no email, no capture list, no sign-out button); signed-in = a search field (icon inside) + a right-aligned profile icon on one row, the rest of the area left uncluttered. A temporary `TEMP_SESSION_STATE` flag stands in for the real state (§11 replaces it); the profile tooltip carries a placeholder name (§13 replaces it).
+
+### 2. What landed — commit `00ae18d` (288 insertions, 6 deletions, across the three popup files)
+
+| File | Change |
+|---|---|
+| `extension/popup/popup.html` | Rebuilt whole (7 → 56 lines): both views defined statically in one container; signed-out = the one `#sign-in-button`; signed-in = the search row (in-field SVG icon + the `#search-input` with its visually-hidden accessible label; the `#profile-button` + `#profile-tooltip` inside a `.profile-slot`) + the `#search-status` line + the `#search-results` slot — the "suitable location" the section leaves for §14 (in §10 both are empty: the area stays uncluttered). Exactly one view is visible (JS toggles `hidden`); the script tag sits last. |
+| `extension/popup/popup.css` | **New** (191 lines): minimal black-and-white per the section's rules — 360px, system-ui, simple 1px borders, no gradients / shadows / animations, no framework; the `.view[hidden]` display guard; visible hover + `:focus-visible` states on the button / field / icon; the tooltip absolutely positioned below the icon (zero layout space — it can never shift the row). |
+| `extension/popup/popup.js` | Rebuilt whole (4 → 46 lines): the v1 launcher dies; the file is only the `TEMP_SESSION_STATE` flag + `render(state)` (toggles the two views) + the `TEMP_PROFILE_NAME` tooltip placeholder. Deliberately no bus messages, no fetch, no token / cookie access — the popup never talks to the backend directly (that is §11 onward, through the worker). |
+| **not touched** | `extension/background.js`, the content scripts, the relay, both manifests, `IE-ClientSide/`, `extension/test/`, all backend code |
+
+### 3. Decisions
+
+- **Atomic stub replacement** (the section's own rule): all three files in one commit; the v1 popup was 11 lines across two files — **no v1 popup line survives** (verified in the backfill: no `:8081` / `window.close` / "Bookmark" in any popup file).
+- **The tooltip is a real element, shown by CSS on slot hover** (not a `title` attribute): §10's acceptance 4 requires the name on hover without shifting the row — absolute positioning makes the shift impossible; §13 fills the text.
+- **The feedback / results slots exist but are empty**: `#search-status` (a `role="status"` live region) + `#search-results` — §14 fills both; in §10 they only reserve the space below the row.
+
+### 4. Verification — actual results
+
+**Backfill session (static, all re-ran):** `node --check` on the committed `popup/popup.js` — clean; the v1-remnant grep over `extension/popup/` (`8081` / `window.close` / `Bookmark`) — zero matches; the rebuilt load dir carries the same three files (the origin constants are the only swap); the §11/§12 work (commit `fc60afa`, below) built on the same two views + the same element IDs — the IDs are stable across the §10 → §11 diff.
+
+**Not re-run (recorded honestly):** the in-browser layout acceptance of the original session (both views rendering at ~360px; the hover / focus states; the tooltip not shifting the row) — that needs the popup opened in a real browser; this backfill session ran no browser (the headless §9 Tier-2 net deliberately does not open the popup — a documented coverage gap). The closest reproducible proxy: the Tier-1b net (landed with §11+§12, below) exercises the same elements through a DOM stub — 37/37.
+
+### 5. Commit
+
+`00ae18d` — "feat(extension): rebuild popup with signed-out and signed-in layouts" (owner-committed; the §0.4 docs update missed it — this entry is the backfill).
+
+### 6. Next step (contract build order)
+
+**§11 — popup authentication-state integration** (wire the real state; remove the temporary flag).
+
+---
+
+## Popup — session-state integration + sign-in navigation — `PopUp_Background_message_relay.md` §11 + §12 (2026-11-01)
+
+**Session:** 2026-11-01 — **backfill entry**: the work landed in commit `fc60afa` (owner-committed), whose §0.4 docs update never happened; this entry is written from the landed code, re-verified in this session. **Branch:** `cloud-migration`. §1–§10 assumed implemented (the worker's §4 semantics + §7 `USER` route are the seams — both already present, so `background.js` needed no change; §10's two views + element IDs are the surface).
+
+### 1. Objective
+
+**§11:** replace §10's temporary `TEMP_SESSION_STATE` flag with the two real links to the worker — on-open `USER` (the bus message that doubles as the session check; the response always wins over the `session_state` cache pre-render) + the C2 `chrome.storage.onChanged` subscription (the worker's state write is the popup's only live link — no polling, no reload, no popup-owned auth). **§12:** the Sign in button opens the frontend's `/login` in a new tab off the popup's own per-manifest `FRONTEND_ORIGIN` copy — `http://localhost:5173` in the dev build, the pinned SaaS origin in the committed build; never `api_base_url` (in dev the API is on `:8080` and has no `/login` page); the value must match the worker's + the relay's copies — three places, one value, one coordinated commit.
+
+### 2. What landed — commit `fc60afa`
+
+| File | Change |
+|---|---|
+| `extension/popup/popup.js` | Rebuilt (46 → 186 lines): the temporary flag dies. **§11:** on open — read `session_state` (the one key; a fresh profile with the key absent pre-renders signed-out — the honest default) *then* send `USER`: `OK` → signed-in, `UNAUTHENTICATED` → signed-out, `ERROR` / `FETCH_ERROR` / unrecognized → **no state change** (the worker's §4 "unknown" rule mirrored — a stale view beats a fabricated one). The storage read resolves first and only then is `USER` sent, so the cache can never overwrite the response ("response always wins" by sequence). The one `chrome.storage.onChanged` listener (the `local` area, the one key; a non-vocabulary value is "no change") re-renders the open popup — the live flip. **§12:** the `FRONTEND_ORIGIN` constant (the popup's own copy of the per-manifest value — the committed file carries the pinned SaaS origin, with the §8 drift rule documented in-line) + the click handler: `chrome.tabs.create({ url: FRONTEND_ORIGIN + "/login" })`. The file header records its own boundaries: no cookie read, no token, no direct backend call, no storage write, no timer. |
+| `dev/manifest-dev.sh` | +10: the line-addressed `FRONTEND_ORIGIN` swap now also reaches `popup/popup.js` in the load dir + a sanity grep that the vite origin landed there (the committed file keeps the pinned origin — local / production URLs never mix in one build). |
+| `extension/test/popup-session.test.mjs` | **New** (389 lines) — the §9 net's Tier 1b: the **real `popup.js`** in a `node:vm` context (a minimal DOM stub + a `chrome` stub) against the **real `background.js`** through the shared `harness.mjs` — the popup's `USER` rides the worker's real bus listener; the worker's `session_state` writes fire the popup's `onChanged` with Chrome-shaped change objects (the C2 broadcast, delivered by the test's pump). Covers §11's AT1–AT6 (open signed-in / signed-out; the stale-cache response-wins rule; the live flip with no reload and no second `USER`; the worker-restart re-open; a sick backend / dead network is not a verdict) + **§12's AT7** (the click opens exactly the loaded build's `FRONTEND_ORIGIN + /login`; the popup's constant equals the worker's — three places, one value) + the static audits. |
+| `extension/test/browser-integration.mjs` | Header note only (±10): the §9 net's "the popup is a v1 stub" rationale is replaced — the popup is not opened in the browser net; its §11 / §12 logic is covered in-repo by Tier 1b. |
+| `extension/test/README.md` | The Tier-1b section (run / needs / duration / coverage) + the "deliberately NOT covered: the popup in the browser" line updated to point at it. |
+| **not touched** | `extension/background.js` (§11's scope line says "if not yet present" — the §4/§7 worker side was already present), the popup `.html` / `.css` (§10's stand, as-is), the content scripts, the relay, both manifests, `IE-ClientSide/`, all backend code |
+
+### 3. Decisions
+
+- **One commit for §11 + §12** (the owner's review unit): §12 is a constant + 3 lines on the §11 file — splitting them would touch the same file twice; the commit message names both.
+- **The popup reads exactly one storage key and never writes** — the §1 C2 + the Authentication contract ("the worker is the sole writer; its write is the broadcast"): the popup is a reader + a listener. The test asserts exactly one `storage.local.get` and one `onChanged` subscription in the source.
+- **`ERROR` / `FETCH_ERROR` is not a verdict** — a backend that does not answer changes nothing (the next check re-arbitrates); a sick backend never logs the user out of the UI.
+- **The origin rule is the §12 drift rule**: the button navigates to the *website*, never the API origin; the popup carries its own copy (it cannot read the worker's variables) — and `dev/manifest-dev.sh` now covers the popup's copy with its own sanity grep, so the dev / prod split is script-enforced, not convention.
+
+### 4. Verification — actual results (backfill session, all re-ran)
+
+- **`node extension/test/popup-session.test.mjs` — 37/37**: the audits (no `document.cookie` / token / `fetch` / XHR / storage-write / timer in the popup source; exactly one key read + one C2 subscription; its own `FRONTEND_ORIGIN` constant) + AT1–AT6 + **AT7** (§12: the click opens exactly `FRONTEND_ORIGIN + /login`; the popup's constant matches the worker's) + the final invariants (storage still exactly the two documented keys; exactly one view visible).
+- **`node extension/test/worker-lifecycle.test.mjs` — 59/59**: the §9 worker-level net is unchanged by this commit; re-ran to confirm the worker side of the seam still holds.
+- **`bash dev/manifest-dev.sh`** — the load dir rebuilt clean (all sanity greps pass): the load-dir `popup.js` carries `http://localhost:5173`, the committed file the pinned origin; `node --check` clean on the load-dir `background.js` + `popup.js`; the committed files keep the production strings.
+- **The three-places agreement** (the §12 rule): the committed `popup.js` / `background.js` / the relay's manifest entry all carry the pinned origin; the dev twins (the load dir + `manifest.dev.json`) all carry the vite origin.
+- **Not re-run (recorded honestly):** the in-browser §11 / §12 acceptance (opening the real toolbar popup; clicking Sign in and the new tab landing on `:5173/login`; a real relay-push flip of an open popup) — the headless Tier-2 net deliberately does not open the popup (a documented coverage gap; Tier 1b is the in-repo stand-in); the original sessions' browser runs are not recorded here.
+
+### 5. Commit
+
+`fc60afa` — "feat(extension): wire popup session state and sign-in navigation" (owner-committed; the §0.4 docs update missed it — this entry is the backfill).
+
+### 6. Next step (contract build order)
+
+- **§13 — popup profile icon + account navigation**: the real name from the `USER` response on hover (first + last, falling back to `display`, then `email`) replacing §10's placeholder; click → `FRONTEND_ORIGIN + /account` (the §12 constant + drift rule).
+- **Carried (unchanged):** the `AUTH_ACCESS_COOKIE_PATH=/` deployment-env sign-off; the Frontend-task emitter (`IE-ClientSide` — when it lands, Tier-2's simulated emission becomes redundant); the §1 `const MSG` collision (board §6 — the injected-button save flow is dead on the four platform origins until it lands); the `AUTH_MODE="header"` flip stays owner-only.
+
+---
+
+## Popup — profile icon and account navigation — `PopUp_Background_message_relay.md` §13 (2026-11-01)
+
+**Session:** 2026-11-01. **Branch:** `cloud-migration`. §1–§12 assumed implemented (the §7 `USER` handler on the worker side is the seam — already present, so `background.js` needed no change; §10's `#profile-button` / `#profile-tooltip` elements are the surface). The §10 + §11/§12 backfill entries above from the previous session were already in the working tree when this session started.
+
+### 1. Objective
+
+Contract §13: the profile icon displays the signed-in user's **real name** on hover — assembled in the popup as `first_name` + `last_name` (space-joined, trimmed) from the `USER` response, falling back to `display`, then `email`, when either name part is blank — and opens **`FRONTEND_ORIGIN + /account`** in a new tab on click (the §12 constant + drift rule). The name is fetched when the popup opens and refreshed on every flip to signed-in; it must never be inferred from anything stored locally; the tooltip must not shift the layout.
+
+### 2. What landed (uncommitted — the owner reviews first)
+
+| File | Change |
+|---|---|
+| `extension/popup/popup.js` | 186 → 231 lines. §10's `TEMP_PROFILE_NAME` placeholder dies: **`displayNameFor(user)`** — `first_name` + `last_name` (space-joined, trimmed); a blank part → `user.display` → `user.email` → the one terminal **`PROFILE_NAME_FALLBACK = "Account"`** (a *label*, never an identity — it shows only before the first `USER` response lands, or when the backend answers signed-in without a usable name). `checkSession()`'s OK branch sets the tooltip from `response.user` (the name comes from the backend on every check). The C2 listener now, after rendering, **re-runs `checkSession()` on a flip TO signed-in** — the contract's "refreshed on a flip to signed-in"; exactly one extra `USER` per flip, event-driven (still no polling); a flip to signed-out sends nothing (the worker already made its own call before writing that state). New click handler on `#profile-button` → `chrome.tabs.create({ url: FRONTEND_ORIGIN + "/account" })` — the same constant + drift rule as §12. Header / boundary comments updated (the identity exceptions are now the two *navigations*: `/login` and `/account`). |
+| `extension/popup/popup.html` | The tooltip's static text `User` → `Account` + a 3-line comment: the static text is a neutral label, not an identity — `popup.js` replaces it with the real name on open and on every flip to signed-in. (The element, its `role="tooltip"`, the slot, and the icon are §10's stand, unchanged.) |
+| `extension/popup/popup.css` | **Not touched** — §10's absolutely-positioned tooltip (zero layout space, `pointer-events: none`) already satisfies "the tooltip must not shift the layout"; no new style needed. |
+| `extension/background.js` | **Not touched** — §13's scope line says "the `USER` handler … *if not yet present*": it is present (§7, commit `a04689c`) and passes `data.user` through untransformed — the worker side of the seam was already done. |
+| `extension/test/popup-session.test.mjs` | 389 → 469 lines. The DOM stub gains a `profile-button` element (with an `addEventListener` stub) + a `clickProfile()` helper; the stub's initial tooltip text matches the real HTML (`Account`). **AT4** extended for §13's flip semantics: the flip-back block now takes its request mark *before* the flip (a timing rule — the fake backend's 5 ms latency lets the refresh round-trip finish inside the settle window) and asserts: the flip to signed-in sends exactly one more `USER`, exactly one refresh session GET (the worker's own check + the popup's — no loop), and the tooltip carries the backend's real `S9 Probe`. **New AT8:** open while signed-in → the tooltip shows the real name, not a placeholder; a click opens exactly the loaded build's `FRONTEND_ORIGIN + /account`; the fallback chain exercised as *live backend answers* (the fake serves `this.user` per request): blank `last_name` → `display`; blank names + blank `display` → `email`; a 200 with no user (a backend contract violation) → the neutral label, no crash, no invented identity. **New static audit:** the name-assembly chain (`first_name` / `last_name` / `.display` / `.email`) is present in the popup source. Header comments updated (§11–13, the AT list). |
+| `dev/manifest-dev.sh` | **Not touched** — its line-addressed `FRONTEND_ORIGIN` swap over `popup/popup.js` keeps working (the constant line is unchanged); the load dir was rebuilt and carries `http://localhost:5173`, the committed file the pinned origin. |
+| `planning_docs/extension_milestone_progress.md` | The re-sequenced line's tail: `§13–15 popup` → `§13 ✅ landed 2026-11-01 (summary) → §14–15 popup` (one line, the established board style). |
+
+### 3. Decisions
+
+- **The name lives only in the tooltip text, set from the `USER` response** — the popup renders identity exactly as contract rule 4 / §13 require: the backend's account payload, never a local value. The `session_state` cache pre-renders the *view* but never the *name*; the one neutral label is a label (the HTML's static text equals it, so the pre-JS state and the JS state agree).
+- **A flip to signed-in re-checks; a flip to signed-out does not** — the contract mandates the name refresh on the signed-in flip; the signed-out flip needs no `USER` because the signed-in view (the only consumer of the name) is gone, and the worker already arbitrated before writing that state. `AT4` keeps its original no-polling assertion for the signed-out direction and adds the one-refresh assertion for the signed-in direction.
+- **No `background.js` change** — the §13 scope's "if not yet present" condition fails: the §7 handler already passes `data.user` through, and §7's pass-through is the worker side of this seam.
+- **No CSS change** — "the tooltip must not shift the layout" is already guaranteed structurally by §10's absolute positioning; adding style would be the over-building the section warns against.
+
+### 4. Verification — actual results
+
+- **`node extension/test/popup-session.test.mjs` — 46/46** (was 37; +1 new audit, +3 AT4 flip-refresh checks, +5 AT8 checks): all audits (incl. the §13 name-assembly audit), AT1–AT3, AT5, AT6, AT7 unchanged and green; AT4's new checks and AT8 as described. (First run: 26/27 + a `waitFor` timeout in the AT4 flip block — the request mark was taken *after* the pump, after the refresh had already recorded its GET; fixed by taking the mark before the flip. Recorded honestly: the net caught a test-timing bug of its own, not a code bug — the popup's behavior it asserts is the contract's.)
+- **`node extension/test/worker-lifecycle.test.mjs` — 59/59** — the worker-side net is untouched by this change; re-ran to confirm the seam still holds.
+- **`node --check`** on the committed `popup/popup.js` and the rebuilt load-dir copy — clean.
+- **`bash dev/manifest-dev.sh`** — the load dir rebuilt clean (all sanity greps pass): the load-dir `popup.js` carries `http://localhost:5173` (incl. the new `/account` line off the same constant), the committed file keeps the pinned origin.
+- **Not re-run (recorded honestly):** the in-browser §13 acceptance — a real hover showing the real name, and a real click landing a new tab on the frontend's `/account` — needs the popup open in a real browser over the live bench; the headless Tier-2 net deliberately does not open the popup (the documented coverage gap; Tier 1b is the in-repo stand-in). The Tier-2 browser net was not run this session (no live bench stood up).
+
+### 5. Commit
+
+**Not committed** — the owner asked to review first. The drafted message (covers this session's three code/doc files; the working tree *also* carries the previous session's uncommitted `extension_documention.md` §10 + §11/§12 backfill entries, which the owner may want in the same or a separate commit):
+
+```
+feat(extension): profile icon — real name on hover, /account on click (§13)
+
+The §10 tooltip placeholder dies. The name is assembled in the popup
+from the USER response's user payload — first + last (space-joined,
+trimmed), a blank part falling back to display, then email — and set
+on open and on every flip to signed-in (one event-driven USER per
+flip; a flip to signed-out sends nothing; still no polling). A 200
+with no usable name degrades to one neutral label, never an identity
+inferred from storage. The profile icon's click opens
+FRONTEND_ORIGIN + /account — the §12 constant and drift rule, so the
+committed build points at the pinned SaaS account page and the dev
+load dir at :5173/account.
+
+background.js is untouched: §13's "if not yet present" condition
+fails — the §7 USER handler already passes data.user through.
+popup.css is untouched: §10's absolutely-positioned tooltip already
+takes zero layout space (the no-shift rule stands).
+
+The popup-session net gains the profile-button stub + AT8 (real
+name from the backend; /account navigation off the loaded build's
+origin; the full fallback chain as live fake-backend answers) and
+the AT4 flip-to-signed-in refresh checks; 46/46. Worker-lifecycle
+59/59 stands.
+```
+
+### 6. Next step (contract build order)
+
+- **§14 — popup search integration**: the Enter handler → `SEARCH { q }` through the bus, loading feedback (the field is disabled or an indicator shown for the ≥4.5 s embedding call), recoverable errors, and the results region (every result the backend returns — no cap — `summary_text` clamped to two lines + `score` as-is + `created_at`; a row with a `source_url` links it in a new tab, a row without renders inert). The `#search-status` / `#search-results` slots from §10 exist for exactly this.
+- **Carried (unchanged):** the `AUTH_ACCESS_COOKIE_PATH=/` deployment-env sign-off; the Frontend-task emitter (`IE-ClientSide` — when it lands, Tier-2's simulated emission becomes redundant); the §1 `const MSG` collision (board §6 — the injected-button save flow is dead on the four platform origins until it lands); the `AUTH_MODE="header"` flip stays owner-only.
