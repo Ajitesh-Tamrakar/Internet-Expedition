@@ -14,7 +14,7 @@ A fresh session should hold the repo's current state before building anything fr
 |---|---|
 | Extension bus contract (`planning_docs/PopUp_Background_message_relay.md` — local-only) | §1–§9 all landed (2026-10-31/11-01): the `MSG`+`STATUS` catalog, the sync relay, the single-listener dispatcher, auth + session lifecycle, the one shared request path, search, library + user, capture coordination, the in-repo test net. **§10–§12 (the popup) landed 2026-11-01** (two-view layout, session-state integration, sign-in navigation). Remaining: §13's remainder (the profile icon's real name + account navigation), §14 (popup search), §15 (final integration + cleanup). |
 | Worker capture path (`extension/background.js`, the CAPTURE COORDINATION section) | Reads the **v1 envelope** (`toCanonicalCapture` + the five per-platform mappers) and submits the current four-field canonical capture (`text` list / `image` screenshot / `media` `{url}` objects / `source_url`), always-multipart. **This document rewrites that seam** (Section 6). |
-| Content scripts (`extension/content/`) | All five send the v1 envelope (`mandatory_fields` / `platform_specific_data`). **This document rewrites four of them** (`universal.js`, `twitter.js`, `youtube.js`, `pinterest.js`) to the canonical shape; **LinkedIn is deferred** (owner rebuilds it later). **Live bug on the milestone board:** all five declare a top-level `const MSG` in the page's shared isolated world → the duplicate declaration kills the later-injected script → **injected save buttons are dead on the four platform origins** (the context-menu path still works). The one-line-per-file rename is a separate board item; this document's scripts must not add new generic top-level names. |
+| Content scripts (`extension/content/`) | All five send the v1 envelope (`mandatory_fields` / `platform_specific_data`). **This document rewrites four of them** (`universal.js`, `twitter.js`, `youtube.js`, `pinterest.js`) to the canonical shape; **LinkedIn is deferred** (owner rebuilds it later). **Live bug on the milestone board:** all five declare a top-level `const MSG` in the page's shared isolated world → the duplicate declaration kills the later-injected script → **injected save buttons are dead on the four platform origins** (the context-menu path still works). The one-line-per-file rename lands as **step 0 of this build** (owner decision 2026-11-03 — the build order below, Section 11); the rewritten scripts must not add new generic top-level names. |
 | Backend (`core/`) | SaaS pipeline: media ingest (plain `requests.get` per stored URL — no platform downloaders) → Gemini context → embeddings. The `CaptureSerializer` accepts the historical shapes; **this document adds canonical acceptance** (Section 10). Processing beyond storage is a separate backend concern (Section 10, item 5). |
 | Frontend (`IE-ClientSide/`) | Landed (2026-10-30): `/login`, `/signup` (6-digit code verification), `/account`, `/search` (placeholder), `/account/password/reset`; cookie-only session; vitest suites. The ~5-line sync-event emitter is the one missing piece (a carried open item — the test net simulates the emission until it lands). |
 | Test net (`extension/test/`, zero npm, `node ≥ 22`) | Three tiers: `worker-lifecycle.test.mjs` (the real worker in `node:vm`; 59 checks), `popup-session.test.mjs` (the real popup against the real worker; 37 checks), `browser-integration.mjs` (full integration on the live bench; 37 checks). The `SAVE` fixtures in the worker-lifecycle and browser-integration files **encode the v1 envelope and must be updated to the canonical shape** (Section 6). |
@@ -24,11 +24,12 @@ A fresh session should hold the repo's current state before building anything fr
 
 **Build order for this document's sections:**
 
+0. **Step 0 — the `const MSG` rename** (owner decision 2026-11-03): each of the five content scripts renames its top-level `MSG` constant to a project-unique name — the live collision that kills the injected save buttons on the four platform origins (Section 11). A standalone commit that lands **before everything else**: it is the precondition for every platform-adapter browser test.
 1. **Section 10** — the backend serializer accepts the canonical shape (additive; everything else keeps working).
 2. **Section 6** — the worker SAVE seam reads the canonical shape; the v1-envelope reader + the five mappers are retired; the `SAVE` fixtures in the test net update in the same landing.
 3. **Sections 1/2/4/5** — the `universal.js` rewrite (general web: the Readability-or-fallback text, the link/media extraction step, the metadata harvest, the canonical object assembly, the `capture_id` toast).
 4. **Sections 7/8/9** — the `twitter.js` / `youtube.js` / `pinterest.js` rewrites (LinkedIn: deferred, not in this build).
-5. Run the test net: tier 1 + tier 1b (seconds, no bench), then the live bench per `extension/test/README.md` before recording the build complete in the session log.
+5. **Section 11 — run the full net** (L1 suite → L2 + L3 → L4 bench → the owner's manual smoke) and record the actual results in the session log + board.
 
 **Relation to the other docs:** the bus envelope (`type` + `data`, the `STATUS` vocabulary, auth and request rules) is owned by the contract doc; **this document owns the canonical capture object** (Section 5) and everything that shape implies on both sides of the bus. If the two ever disagree about the capture's shape, this document is the later one and its owner decisions stand — the session log records each decision with the reason. The contract doc is local-only; if it is absent from a checkout, the worker's catalog block in `extension/background.js` is the bus contract, and this file (git-tracked) is the capture contract.
 
@@ -84,6 +85,12 @@ Readability's `content` is filtered article HTML, not the complete webpage HTML.
 
 The non-article fallback for pages that are not suitable for Readability is defined in Section 4. Do not define that fallback as part of this section.
 
+### Acceptance
+
+- **L3 (script vm tier):** with a stubbed `Readability`, a `null` parse result takes the fallback path without crashing; Readability-provided values map to the canonical names (`siteName` → `site_name`, `lang` → `language`) — the mapping is asserted, the vendor itself is not re-tested.
+- **L4 (live bench):** a real article page → non-empty `text` that is the article (not a body dump); a real non-article page → the `innerText` fallback; a real page whose parse fails → the fallback path, and the save still completes.
+- **Evidence:** the stored row's `text` is non-empty and came from the expected path.
+
 ## Section 2: Link and Media URL Extraction
 
 ### Where it lives: inside the new `content/universal.js` (no new file)
@@ -93,12 +100,12 @@ The step is part of the rewritten `content/universal.js` — **not** a separate 
 Two facts pin this placement:
 
 - **It has exactly one caller.** Only the general-web flow in `universal.js` needs it; the platform adapters (Twitter, YouTube, Pinterest) each do their own platform-specific extraction and never touch it. A separate file would add manifest entries, a load-order rule, and one more script in the page's shared scope, with zero reuse in return.
-- **The isolated-world rule.** Every content script Chrome injects into a page runs in that page's *one* shared JavaScript scope (the "isolated world"). On platform origins, `universal.js` **and** the platform script both live in that scope. A top-level `const`/`let` in one script that collides with the same name in another **kills the later script with a `SyntaxError` before any of its code runs** — this is a live, tracked bug: five content scripts each declare a top-level `const MSG`, which is why injected save buttons are currently dead on the four platform origins (milestone board, open item). Folding the step in keeps the file count flat instead of widening that blast radius.
+- **The isolated-world rule.** Every content script Chrome injects into a page runs in that page's *one* shared JavaScript scope (the "isolated world"). On platform origins, `universal.js` **and** the platform script both live in that scope. A top-level `const`/`let` in one script that collides with the same name in another **kills the later script with a `SyntaxError` before any of its code runs** — this is a live, tracked bug: five content scripts each declare a top-level `const MSG`, which is why injected save buttons are currently dead on the four platform origins (milestone board, open item; renamed as step 0 of this build — Section 11). Folding the step in keeps the file count flat instead of widening that blast radius.
 
 Consequences for the implementation:
 
 - **No manifest changes.** `universal.js` is already registered on `<all_urls>` (minus the app origin) in both manifests; the step rides that existing entry — no new entry, no `web_accessible_resources`, no new permission.
-- **Naming discipline:** the step's helpers should be `function` declarations with project-unique names (e.g. `ieExtractPageLinks`, `ieExtractMedia`). Two same-named `function` declarations across scripts at least do not crash, but two same-named `const`/`let` **do** — and a same-named `function` that gets silently shadowed is just as wrong. Do not introduce new top-level `const`s with generic names a platform script might also declare (`MSG`, `STATUS`, …). The file's existing single `const MSG` block stays as-is; the across-file rename is the board's separate hotfix item.
+- **Naming discipline:** the step's helpers should be `function` declarations with project-unique names (e.g. `ieExtractPageLinks`, `ieExtractMedia`). Two same-named `function` declarations across scripts at least do not crash, but two same-named `const`/`let` **do** — and a same-named `function` that gets silently shadowed is just as wrong. Do not introduce new top-level `const`s with generic names a platform script might also declare (`MSG`, `STATUS`, …). Step 0 renames each script's `MSG` to a project-unique name (Section 11); the rewritten files must end the same way.
 - **Isolated world, not the page's world:** the step reads the original page DOM (`document`), which is fully readable from the isolated world — no `window.postMessage` / main-world bridge is needed or permitted for it.
 
 ### How it should work
@@ -144,6 +151,12 @@ Some embedded or streaming media may not expose a direct resource URL, so not ev
 
 **Naming distinction:** `media.images` contains webpage image URLs. It is not the screenshot of the page. The screenshot is a separate top-level `screenshot` field. The plural keys intentionally match the backend's `*_sources` column names, so the canonical shape survives the trip to the server without a key rename.
 
+### Acceptance
+
+- **L3 (primary — stub-DOM battery):** categories fill from the right sources (`<a>` → `links`, `<img>` → `images` with `currentSrc` preferred over `src`, `<video>`/`<source>` → `videos`, the two embed-iframe patterns → `videos`, `<audio>` → `audios`); `data:`/`blob:`/`mailto:`/`tel:`/`javascript:`/`#` URLs dropped; relative URLs resolved to absolute; dedupe preserves document order; **the caps are exact after dedupe** — a 60-image page yields exactly 50 (the first 50 in document order), 12 videos → 10, 150 links → 100; the returned object is Section 5's `media` shape.
+- **Source audit:** no new generic top-level `const`s; the selector set stays at the owner-pinned minimum (no `data-src` guessing, no new iframe patterns).
+- **L4:** a real page with images → `media.images` non-empty, ≤ 50, all absolute URLs; a link-heavy page → `metadata.links` ≤ 100.
+
 ## Section 3: Screenshot Capture
 
 ### What we want
@@ -159,6 +172,12 @@ Capture a screenshot of the currently visible browser tab using Chrome's `chrome
 - The screenshot stays a separate field of the canonical object — never folded into `text`, `metadata`, or any JSON-serialized value. Inside the extension its value is the data-URL string that `chrome.tabs.captureVisibleTab()` returns (or `null` when capture failed — the only representation a content script can hold); the worker converts it to the `file:screenshot:0` file part on submission (Section 6), so no base64 string ever rides a form field.
 
 For clarity in the collection code, the screenshot is referred to as `screenshot` — that is its canonical field name in Section 5. The worker sends it to the backend as the multipart file part `file:screenshot:0` (Sections 6 and 10); the legacy `image` form field / `file:image:0` part remains accepted for other clients.
+
+### Acceptance
+
+- **L3:** the canonical object carries the worker-supplied data-URL string, or `null`; a `null` screenshot still assembles a savable object; the screenshot never appears inside `text` / `metadata` / `media` (source audit).
+- **L2:** a `CAPTURE_WEB` with a screenshot data-URL → the worker's form carries `file:screenshot:0` (a real `File`, converted exactly once); a `null` screenshot → no file part, and the save still submits.
+- **L4:** a real `captureVisibleTab` → the backend stores the file under the capture's storage prefix (asserted on the stored row); an induced capture failure → 201 with no screenshot, the row completes.
 
 ## Section 4: Save Trigger and General-Web Readability Flow
 
@@ -195,6 +214,12 @@ The rules run best-effort: a tag absent on a page simply leaves its field unpopu
 ### Confirmation message
 
 The save flow should trigger the existing confirmation message/toast through `content/confirmation.js`. The confirmation UI is shared presentation; the actual collection logic differs by page type. YouTube, X/Twitter, Pinterest, and LinkedIn keep their platform-specific capture implementations, while general webpages follow the Readability-or-`document.body.innerText` flow described above.
+
+### Acceptance
+
+- **L3 (the harvest battery, stub `<head>`):** each rule — tag present → field populated; tag absent → key **omitted** (no `null` / empty string / placeholder); each fallback fires (`description` → `og:description`, `og:image` → `twitter:image`, `published_at` → first `<time datetime>`); where both sources supply a value, Readability's wins (e.g. `site_name`); `content_type` = `article` / `website` by the path taken.
+- **L3 (trigger audit):** the general-web flow triggers only from `CAPTURE_WEB`; the script injects no UI (no button code in the file).
+- **L4:** a real page carrying meta tags → those values appear in the stored `metadata`; a tag-less page → the keys omitted, the save completes.
 
 ## Section 5: Canonical Collected Data Shape
 
@@ -262,6 +287,12 @@ This is a logical shape for the collected information, not a JSON serialization 
 
 The `metadata` object contains the additional page information. Keep `text`, `source_url`, `media`, and the screenshot as their own fields; do not nest them inside `metadata`.
 
+### Acceptance
+
+- **L3:** the assembled SAVE `data` deep-equals the shape's key set — `text` a **string** (never a list), `source_url`, `screenshot` (data-URL or `null`), `media` with exactly the four plural keys, `metadata` snake_case — asserted for each path: article, fallback, no-screenshot.
+- **Source audit (all five content scripts):** no `mandatory_fields` / `platform_specific_data` anywhere; no singular `image`/`video`/`audio` keys; no `bookmark_id` reads (the toast reads `capture_id`).
+- **L2 + L4:** the object round-trips — the worker accepts it and the backend returns 201; the shape is proven end-to-end, not in isolation.
+
 ## Section 6: Message Bus and Component Communication
 
 ### Purpose
@@ -304,6 +335,11 @@ The `data` slot of `SAVE` now carries the canonical object of Section 5, assembl
 - **LinkedIn (deferred):** its content script still sends the v1 envelope. After the purge, a LinkedIn save maps to an empty canonical object and fails gracefully at the usable-content check (error toast, nothing submitted) — acceptable per the owner, since the adapter is non-functional today and will be rebuilt against the canonical shape later. The worker gets **no** LinkedIn-specific code.
 - **Existing tests:** the `SAVE` fixtures in `extension/test/` (`worker-lifecycle.test.mjs`, `browser-integration.mjs`) send the v1 envelope and must be updated to the canonical shape as part of this work; the net's other assertions (auth envelopes, the multipart POST, the storage audit) are unchanged.
 
+### Acceptance
+
+- **L2 (primary — updated fixtures):** a canonical SAVE → the exact multipart form (`text` a plain string with **no** JSON quotes, `media` / `metadata` JSON strings, `source_url` raw, `file:screenshot:0` present only when a screenshot exists); a **v1-envelope SAVE now maps to nothing usable** → code-0 `ERROR` with **zero fetches** (the no-dual-shape proof); the `hasUsableContent` matrix (text-only / media-only / screenshot-only / all-empty → the last fails gracefully); a failing screenshot conversion degrades to a no-screenshot save, never a failed save; the 401 path reuses the same `FormData` across the one-recovery-one-retry; the status mapping and `UNAUTHENTICATED` + `sign_in_url` stay exactly as the settled contract.
+- **L4:** the browser-integration `SAVE` op on a canonical payload → 201 → the `LIBRARY` op carries the new row.
+
 ## Section 7: Twitter/X Capture Requirements
 
 ### What we want
@@ -331,8 +367,8 @@ Twitter/X captures should use the following structure:
   },
   metadata: {
     platform: "twitter",
-    tweetId: "123456789",
-    authorName: "Example User",
+    tweet_id: "123456789",
+    author_name: "Example User",
     username: "@example",
     timestamp: "2026-11-01T10:00:00.000Z"
   }
@@ -346,8 +382,8 @@ The example values are illustrative. Actual values must come from the captured t
 - `media.images` — an array of collected image URLs.
 - `media.videos` — an array of video-related URLs, including the tweet URL when needed for backend video retrieval. (Unlike YouTube, which omits its watch-page URL from `media.videos` — see Section 8.3: each platform adapter makes its own media decision, and the backend's per-platform handling, when the owner adds it, is what resolves the difference.)
 - `metadata.platform` — identifies the platform as `twitter`.
-- `metadata.tweetId` — the extracted tweet ID.
-- `metadata.authorName` — the author's displayed name.
+- `metadata.tweet_id` — the extracted tweet ID.
+- `metadata.author_name` — the author's displayed name.
 - `metadata.username` — the author's username.
 - `metadata.timestamp` — the timestamp collected from the tweet, when available.
 
@@ -360,7 +396,7 @@ The extension should continue using the existing URL extraction behavior in `twi
 1. Find a link containing `/status/` inside the tweet element.
 2. Resolve the link into a complete URL, using the current page's origin when the link is relative.
 3. Extract the tweet ID by matching the digits immediately following `/status/` in the complete URL.
-4. Store the complete URL in `source_url` and the extracted ID in `metadata.tweetId`.
+4. Store the complete URL in `source_url` and the extracted ID in `metadata.tweet_id`.
 
 The extension obtains the URL first and extracts the ID from it. It does not construct the URL from the tweet ID.
 
@@ -385,6 +421,12 @@ Twitter/X remains a platform-specific capture flow, as described in Section 4. I
 The Twitter/X capture object must follow the field organization defined in this section. Any changes to the message payload must remain consistent with the shared message-bus contract and the background component that receives it.
 
 This section defines the required Twitter/X capture data and behavior. It does not redefine the general-web Readability flow or the backend submission contract.
+
+### Acceptance
+
+- **L3 (stub tweet DOM):** the canonical object — `text` = the tweet body; `source_url` = the resolved status URL (URL obtained first, ID extracted *from* it into `metadata.tweet_id`); posters in `media.images`; **the tweet URL in `media.videos`** (the pinned asymmetry vs Section 8.3); `metadata` flat and snake_case, no `hasMedia`; no screenshot field (the platform scripts never carry one).
+- **Source audit:** no media download / `fetch` anywhere in the script (the retired v1 downloader must not return); the v1 envelope is gone.
+- **L4 (after step 0):** a real tweet page → the injected button works → SAVE → 201; the stored row carries the tweet URL in `video_sources` (link-based) — its later per-item degradation in `processing_media` is the parked processing concern (Section 10, item 5), never a 500.
 
 ## Section 8: YouTube Capture Flow
 
@@ -501,6 +543,12 @@ This section defines the YouTube-specific data collected by the extension and ho
 - Preserve the existing save confirmation and error-handling behavior.
 
 Any changes to the established message payload, backend request format, or response contract must be coordinated with the components that depend on those contracts.
+
+### Acceptance
+
+- **L3 (stub watch page):** `text` = `""` (no transcript in the extension); `source_url` = the watch-page URL; **`media.videos` empty** (the pinned asymmetry vs Section 7 — the watch URL is not a direct file URL); `metadata` = `platform` / `title` / `author` / `author_link`.
+- **Source audit:** the script never downloads or transcodes; no transcript logic.
+- **L4 (after step 0):** a real watch page → the injected button → SAVE → 201; the stored row: empty `text`, no `video_sources` entries, the watch URL in `source_url`.
 
 ## Section 9: Pinterest Capture Flow
 
@@ -658,6 +706,12 @@ Pinterest capture is limited to the pin information and image resource needed to
 
 This section defines Pinterest-specific collection, data mapping, and component responsibilities. It does not independently redefine the backend API, authentication, request format, media-upload protocol, or server-response contract.
 
+### Acceptance
+
+- **L3 (stub pin page):** `media.images` = the resolved image URL (an empty array when none); the pin's alternative text → `text`; **`metadata.image_srcset` preserved** in full (the data for the parked backend enhancement — 9.5; the extension preserves, the backend may later select); `source_url` = the pin URL; no screenshot field.
+- **Source audit:** the script never downloads the image file (retired v1 behavior must not return).
+- **L4 (after step 0):** a real pin → the injected button → SAVE → 201; the stored row: the image entry link-based in `image_sources`, the full srcset in `metadata`.
+
 ## Section 10: Backend — Accepting the Canonical Shape (`core/api/serializers.py`)
 
 The worker submits the canonical shape as multipart (Section 6), so `CaptureSerializer.create()` must accept it. The historical forms (plural `images`/`videos`/`audios` keys, `{"url": …}` dict items, the `image` screenshot carrier) **keep working for other clients** — this section is additive. Changes:
@@ -667,6 +721,28 @@ The worker submits the canonical shape as multipart (Section 6), so `CaptureSeri
 3. **`media.links`:** the `Capture` model has no links column, so the serializer merges `media.links` into **`metadata.links`** — the owner-decided home for links, returned to clients with the capture. If the merged metadata would exceed the size gate, drop the links key and proceed (a per-key degradation, never a 400): a capture with a huge link list must still save.
 4. **Unchanged:** `text` (a plain string already parses to a single-item list — this is why the worker must not JSON-quote it), `source_url` (dedicated model column), `metadata` (JSON object, 64 KB gate), the response shape (source lists stripped, `capture: "success"` added), statuses, and the pipeline.
 5. **Pipeline boundary (out of this document):** how the backend later *processes* a stored media URL — download quality, platform-specific retrieval (e.g. yt-dlp for tweet/watch pages, which the owner will add later) — is a separate backend task. This document's responsibility ends at **storage**: the URL is accepted, stored in the right `*_sources` column (or `metadata.links`), and the capture row completes. What a page-URL item later degrades into during `processing_media`/`processing_context` is a processing concern, not a collection or submission defect, and this document makes no requirement about it.
+
+### Acceptance
+
+- **L1 (Django suite — primary):** a canonical multipart create — a plain-string `text` stored **without** quotes; `media` JSON strings with **plain-URL items** → `*_sources` entries, alongside `{"url": …}` dict items (regression guard); the `screenshot` data-URL field and the `file:screenshot:0` part (the file part wins when both are present); the legacy `image` / `file:image:0` carriers still work; `media.links` merges into `metadata.links` and is returned on the row; an over-gate merge **drops the links key and still returns 201** (never 400); the per-file / per-capture size gates cover the `screenshot` part family.
+- **Regression:** the existing historical-shape tests pass unchanged (this section is additive).
+- **L4:** the probe-account create over a real request in the canonical shape → 201 (this is also part of the step-5 net run).
+
+## Section 11: Testing — the Four Layers
+
+Every section above carries an Acceptance block; the blocks reference these four layers. Three are the in-repo test net and the Django suite (zero npm, `node ≥ 22`); the fourth is new and lands with this build. No other test infrastructure is added.
+
+- **L1 — the Django suite** (`venv/bin/python manage.py test core`). Offline (Gemini mocked); needs a running pgvector Postgres (the `ie-test-db` docker or a scratch cluster with `DB_*` overrides — a remote DB runs the full suite in ~90 s, a local one in seconds). Proves the backend half: Section 10.
+- **L2 — the worker tier** (`node extension/test/worker-lifecycle.test.mjs`). The real `background.js` in a `node:vm` context against a scripted fake backend — seconds, no bench. Proves the worker seam: Section 6.
+- **L3 — the script tier (new in this build).** The tier-1b pattern (`popup-session.test.mjs`) generalized: the **real content-script file** in a `node:vm` context against a stub DOM, with a **stub `Readability` + `isProbablyReaderable`** for `universal.js` (the 2786-line vendor needs a full DOM — not buildable zero-npm; the stub tests *our* code around it, and the vendor-on-a-real-DOM question stays covered by L4). Lands as `extension/test/script-capture.test.mjs` + a README section; one stub DOM per page shape (article page / tweet / watch page / pin), shared across the four scripts' tests. Proves the content scripts: Sections 1, 2, 4, 5, 7, 8, 9.
+- **L4 — the live bench** (`node extension/test/browser-integration.mjs` + the owner's manual load-unpacked smoke). Real headless browser + the dev build + backend `:8080` + vite `:5173` + the self-cleaning probe account; the bench must be rebuilt after a reboot (the recipe is in `extension/test/README.md`). Proves what only a real browser can: Readability on a real DOM, `captureVisibleTab` bytes, the injected buttons, the full bus round-trip.
+
+**Step 0 — the `const MSG` rename (lands first).** A standalone commit: each of the five content scripts renames its top-level `MSG` constant to a project-unique `ie`-prefixed name (one symbol per file — the board's one-line-per-file hotfix). The bus **values** (the strings `SAVE`, `CAPTURE_WEB`, …) are unchanged; only the constant identifiers move, so no other component is affected.
+
+- Why it lands first: the collision is why the injected buttons are dead on the four platform origins, and every platform-adapter L4 check above is gated on the buttons working.
+- **Acceptance:** L3 loads `universal.js` **and** one platform script into the *same* vm context (reproducing the shared isolated world) → both evaluate, no `SyntaxError`; L4: on each of the four platform origins the injected save button is present, and the context-menu path still works.
+
+**Step 5 — the full net run (build complete), in order:** L1 (the suite) → L2 + L3 (seconds, no bench) → L4 (the bench) → the owner's manual smoke (right-click a real page → toast with the `capture_id` → inspect the stored row). The session log records the **actual** numbers of every tier — never claim a test that was not run, including failures and environment quirks — and the bench is left exactly as found (probe account deleted; scratch servers stopped).
 
 ### Scope boundary
 
